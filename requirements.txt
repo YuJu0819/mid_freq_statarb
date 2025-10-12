@@ -1,0 +1,12 @@
+pandas>=2.2.0
+numpy
+pyarrow>=16.0.0
+python-binance>=1.0.19
+ccxt>=4.3.88
+pydantic>=2.6.0
+pytz>=2024.1
+python-dotenv>=1.0.1
+websockets>=12.0
+pyyaml>=6.0.2
+# pandas-ta
+matplotlib>=3.8.0

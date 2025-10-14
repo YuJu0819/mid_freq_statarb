@@ -35,14 +35,14 @@ class FinalStrategy:
             avg_volume_ratio = df["volume_ratio"].rolling(30).mean().iloc[-1]
 
             trend_score = price_roc * (1 + oi_roc)
-            sentiment_score = basis_momentum * avg_volume_ratio
+            sentiment_score = basis_momentum * avg_volume_ratio * 5
             combined_score = trend_score + sentiment_score
 
             avg_funding_rate = df["funding_rate"].iloc[-self.funding_lookback:].mean()
             funding_penalty = 1.0
-            if (avg_funding_rate > self.funding_threshold and combined_score > 0) or \
-               (avg_funding_rate < -self.funding_threshold and combined_score < 0):
-                funding_penalty = 0.25
+            # if (avg_funding_rate > self.funding_threshold and combined_score > 0) or \
+            #    (avg_funding_rate < -self.funding_threshold and combined_score < 0):
+            #     funding_penalty = 0.25
 
             final_score = combined_score * funding_penalty
             final_scores[symbol] = final_score
@@ -50,7 +50,7 @@ class FinalStrategy:
             score_components[symbol] = {
                 'price_roc': price_roc, 'oi_roc': oi_roc, 'trend_score': trend_score,
                 'basis_momentum': basis_momentum, 'avg_volume_ratio': avg_volume_ratio,
-                'sentiment_score': sentiment_score, 'funding_penalty': funding_penalty,
+                'sentiment_score': sentiment_score, 'funding_penalty': funding_penalty, 'avg_funding_rate': avg_funding_rate,
                 'final_score': final_score
             }
 
@@ -74,7 +74,7 @@ class FinalStrategy:
             signals[symbol] = SignalEvent(
                 symbol=symbol, weight=(long_scores[i] / total_long_score))
 
-        short_scores = [len(shorts) - i for i in range(len(shorts))]
+        short_scores = [i + 1 for i in range(len(shorts))]
         total_short_score = sum(short_scores)
         for i, (symbol, score) in enumerate(shorts):
             signals[symbol] = SignalEvent(

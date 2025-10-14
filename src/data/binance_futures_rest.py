@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- FIX: Initialize the client properly ---
 api_key = os.getenv("BINANCE_API_KEY")
 api_secret = os.getenv("BINANCE_API_SECRET")
 use_testnet = os.getenv("BINANCE_USE_TESTNET", "false").lower() == "true"
@@ -22,36 +21,39 @@ def fetch_open_interest(symbol: str, interval: str = "1d", limit: int = 500) -> 
         oi_data = client.futures_open_interest_hist(
             symbol=symbol, period=interval, limit=limit
         )
-
         if not oi_data:
             return pd.DataFrame()
-
         df = pd.DataFrame(oi_data)
         df["sumOpenInterestValue"] = pd.to_numeric(
             df["sumOpenInterestValue"], errors="coerce"
         )
         df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
-
         df.rename(
             columns={"sumOpenInterestValue": "open_interest", "timestamp": "ts"},
             inplace=True,
         )
-
         df = df[["ts", "open_interest"]]
-        # print(df)
         return df
-
     except BinanceAPIException as e:
         print(f"Error fetching open interest for {symbol}: {e}")
         return pd.DataFrame()
 
 
-def fetch_funding_rate(symbol: str, limit: int = 500) -> pd.DataFrame:
+def fetch_funding_rate(symbol: str, start_date: str = None, end_date: str = None, limit: int = 1000) -> pd.DataFrame:
     """
-    Fetches historical funding rates.
+    Fetches historical funding rates for a given symbol and date range.
     """
     try:
-        fr_data = client.futures_funding_rate(symbol=symbol, limit=limit)
+        # Convert string dates to milliseconds for the API
+        startTime = int(pd.to_datetime(start_date).timestamp()
+                        * 1000) if start_date else None
+        endTime = int(pd.to_datetime(end_date).timestamp()
+                      * 1000) if end_date else None
+
+        # --- DEFINITIVE FIX: The correct method name is futures_funding_rate ---
+        fr_data = client.futures_funding_rate(
+            symbol=symbol, startTime=startTime, endTime=endTime, limit=limit
+        )
 
         if not fr_data:
             return pd.DataFrame()

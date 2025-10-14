@@ -37,10 +37,8 @@ def load_local_oi_data(symbol, start_date, end_date, data_dir="./data/open_inter
 
     combined_df = pd.concat(all_oi_df, ignore_index=True)
 
-    # --- DEFINITIVE FIX: The 'create_time' column is a date STRING, not milliseconds ---
     combined_df.rename(columns={
                        'sum_open_interest_value': 'open_interest', 'create_time': 'ts'}, inplace=True)
-    # Correctly parse the date string
     combined_df['ts'] = pd.to_datetime(combined_df['ts'])
 
     oi_df = combined_df[['ts', 'open_interest']].copy()
@@ -66,7 +64,7 @@ def main():
     for symbol in symbols:
         try:
             # Incrementing suffix to ensure new data is processed
-            fname_suffix = f"{interval}_{args.start_date}_to_{args.end_date}_final_v15"
+            fname_suffix = f"{interval}_{args.start_date}_to_{args.end_date}_final_v16"
             ppath = parquet_path(
                 cfg["general"]["parquet_dir"], symbol, fname_suffix)
             df = load_bars(ppath)
@@ -91,7 +89,10 @@ def main():
                     print(
                         f"Warning: No local Open Interest data found for {symbol}. OI will be 0.")
 
-                fr_df = fetch_funding_rate(symbol, limit=1000)
+                # --- FIX: Pass start_date and end_date to fetch historical funding rates ---
+                print(f"Fetching funding rate for {symbol}...")
+                fr_df = fetch_funding_rate(
+                    symbol, start_date=args.start_date, end_date=args.end_date, limit=1000)
 
                 # Timestamps from klines are milliseconds (numeric)
                 spot_df['ts'] = pd.to_datetime(spot_df['ts'], unit='ms')
@@ -153,6 +154,15 @@ def main():
             os.getcwd(), "reports", "score_inspection.csv")
         res.score_history.to_csv(score_save_path, index=False)
         print(f"Score component breakdown saved to: {score_save_path}")
+    if not res.equity_curve.empty:
+        report_dir = os.path.join(os.getcwd(), "reports")
+        if not os.path.exists(report_dir):
+            os.makedirs(report_dir)
+        start_str = res.equity_curve.index[0].strftime('%Y-%m-%d')
+        end_str = res.equity_curve.index[-1].strftime('%Y-%m-%d')
+        save_path = os.path.join(
+            report_dir, f"equity_curve_{start_str}_to_{end_str}.png")
+        plot_equity_curve(res.equity_curve, save_path)
 
 
 if __name__ == "__main__":

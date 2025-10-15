@@ -32,10 +32,13 @@ def run_multi_asset(data: dict[str, pd.DataFrame], strategy, cfg: dict) -> Backt
 
     for i, ts in enumerate(timeline):
         current_prices = {}
+        latest_rows = {}
         for sym in symbols:
             price_series = data[sym][data[sym]["ts"] <= all_ts[i]]
             if not price_series.empty:
-                current_prices[sym] = price_series["futures_close"].iloc[-1]
+                latest_row = price_series.iloc[-1]
+                current_prices[sym] = latest_row["futures_close"]
+                latest_rows[sym] = latest_row
 
         assets_to_price = {
             s for s in broker.positions if broker.positions[s]['qty'] != 0}
@@ -79,20 +82,48 @@ def run_multi_asset(data: dict[str, pd.DataFrame], strategy, cfg: dict) -> Backt
             side = "BUY" if delta > 0 else "SELL"
             order: Order = {"symbol": symbol, "side": side,
                             "qty": abs(delta), "order_type": "MARKET"}
-            fill = broker.execute(order, last_price)
-            trades.append({"ts": ts, "symbol": symbol, "side": side,
-                          "qty": fill["qty"], "price": fill["price"]})
 
-    eq = pd.DataFrame(equities).drop_duplicates(
-        "ts").set_index("ts").sort_index()
+            # --- DEFINITIVE FIX: Pass the current regime to the broker ---
+            current_row = latest_rows.get(symbol)
+            regimes = {
+                'volatility_regime': current_row.get('volatility_regime', 'Unknown'),
+                'trend_regime': current_row.get('trend_regime', 'Unknown')
+            }
+
+            fill = broker.execute(order, last_price, regimes)
+
+            # Record the trade only if PnL was realized (i.e., it was a closing trade)
+            if fill.get("pnl", 0.0) != 0.0:
+                trades.append({
+                    "ts": ts,
+                    "symbol": symbol,
+                    "side": side,  # This is the side of the closing trade
+                    "qty": fill["qty"],
+                    "price": fill["price"],
+                    "pnl": fill["pnl"],
+                    # Regime from the ENTRY
+                    "volatility_regime": fill["volatility_regime"],
+                    # Regime from the ENTRY
+                    "trend_regime": fill["trend_regime"]
+                })
+
+    if equities:
+        eq = pd.DataFrame(equities).drop_duplicates(
+            "ts").set_index("ts").sort_index()
+    else:
+        eq = pd.DataFrame({'ts': [timeline[0]], 'equity': [
+                          cfg['backtest']['initial_cash']]}).set_index('ts')
+
     tr = pd.DataFrame(trades)
     score_df = pd.DataFrame(all_score_components)
 
     ret = eq["equity"].pct_change().fillna(0.0)
+
     summary = {
         "final_equity": float(eq["equity"].iloc[-1]) if not eq.empty else cfg['backtest']['initial_cash'],
-        "return_pct": float((eq["equity"].iloc[-1] / eq["equity"].iloc[0] - 1) * 100) if not eq.empty else 0.0,
+        "return_pct": float((eq["equity"].iloc[-1] / eq["equity"].iloc[0] - 1) * 100) if not eq.empty and eq["equity"].iloc[0] != 0 else 0.0,
         "sharpe_daily": float((ret.mean() / (ret.std() + 1e-12)) * (365 ** 0.5)) if len(eq) > 2 else 0.0,
+        "daily_win_rate_pct": float((ret > 0).mean() * 100) if not ret.empty else 0.0,
         "trades": int(len(tr))
     }
 

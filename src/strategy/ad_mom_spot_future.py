@@ -40,9 +40,9 @@ class FinalStrategy:
 
             avg_funding_rate = df["funding_rate"].iloc[-self.funding_lookback:].mean()
             funding_penalty = 1.0
-            # if (avg_funding_rate > self.funding_threshold and combined_score > 0) or \
-            #    (avg_funding_rate < -self.funding_threshold and combined_score < 0):
-            #     funding_penalty = 0.25
+            if (avg_funding_rate > self.funding_threshold and combined_score > 0) or \
+               (avg_funding_rate < -self.funding_threshold and combined_score < 0):
+                funding_penalty = 1.5
 
             final_score = combined_score * funding_penalty
             final_scores[symbol] = final_score

@@ -142,7 +142,7 @@ def main():
         return
 
     strat = FinalStrategy(lookback=30, quantile=0.2, min_volume_usd=10_000_000,
-                          funding_lookback=7, funding_threshold=0.0003)
+                          funding_lookback=7, funding_threshold=2e-4)
     res = run_multi_asset(all_data, strat, cfg)
 
     print("\n==== Summary ====")

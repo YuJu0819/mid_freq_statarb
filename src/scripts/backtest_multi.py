@@ -94,7 +94,7 @@ def calculate_market_regimes(btc_df: pd.DataFrame):
                'volatility_regime'] = 'High Volatility'
 
     # --- CHANGE: Use the manual ADX calculation ---
-    btc_df['adx'] = calculate_adx(btc_df, length=14)
+    btc_df['adx'] = calculate_adx(btc_df, length=30)
     btc_df['trend_regime'] = 'Weak Trend'  # Default
     btc_df.loc[btc_df['adx'] > 25, 'trend_regime'] = 'Strong Trend'
     btc_df.loc[btc_df['adx'] < 20, 'trend_regime'] = 'Ranging'
@@ -135,7 +135,7 @@ def main():
     all_data = {}
     for symbol in symbols:
         try:
-            fname_suffix = f"{interval}_{args.start_date}_to_{args.end_date}_final_v17"
+            fname_suffix = f"{interval}_{args.start_date}_to_{args.end_date}_final_v18"
             ppath = parquet_path(
                 cfg["general"]["parquet_dir"], symbol, fname_suffix)
             df = load_bars(ppath)
@@ -200,8 +200,8 @@ def main():
         print("No data was successfully loaded. Exiting backtest.")
         return
 
-    strat = FinalStrategy(lookback=30, quantile=0.2, min_volume_usd=10_000_000,
-                          funding_lookback=7, funding_threshold=2e-4)
+    strat = FinalStrategy(lookback=30, quantile=0.1, min_volume_usd=10_000_000,
+                          funding_lookback=180, funding_threshold=2e-4)
     res = run_multi_asset(all_data, strat, cfg)
 
     print("\n==== Summary ====")

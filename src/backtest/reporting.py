@@ -26,6 +26,11 @@ def generate_regime_analysis_report(trades_df: pd.DataFrame):
         print("\nNo trades or regime data available for analysis.")
         return
 
+    # Ensure PnL column exists
+    if 'pnl' not in trades_df.columns:
+        print("\nWarning: PnL column not found in trades. Cannot generate regime report.")
+        return
+
     print("\n\n==== Market Regime Analysis ====")
 
     # Analyze Volatility Regime
@@ -44,3 +49,36 @@ def generate_regime_analysis_report(trades_df: pd.DataFrame):
     trend_analysis['Win Rate'] = trend_analysis['Win Rate'].map(
         '{:.2%}'.format)
     print(trend_analysis)
+
+# --- NEW FUNCTION ---
+
+
+def generate_weekday_analysis_report(trades_df: pd.DataFrame):
+    """
+    Analyzes and prints strategy performance broken down by weekday.
+    """
+    if trades_df.empty or 'pnl' not in trades_df.columns:
+        print("\nNo trades or PnL data available for weekday analysis.")
+        return
+
+    print("\n\n==== Weekday Performance Analysis ====")
+
+    trades_df['weekday'] = trades_df['ts'].dt.day_name()
+    weekday_order = ['Monday', 'Tuesday', 'Wednesday',
+                     'Thursday', 'Friday', 'Saturday', 'Sunday']
+
+    weekday_analysis = trades_df.groupby('weekday')['pnl'].agg(
+        ['sum', 'count', lambda x: (x > 0).mean()])
+    weekday_analysis.columns = ['Total PnL', 'Trade Count', 'Win Rate']
+    weekday_analysis['Win Rate'] = weekday_analysis['Win Rate'].map(
+        '{:.2%}'.format)
+
+    # Reindex to ensure correct weekday order
+    weekday_analysis = weekday_analysis.reindex(weekday_order).fillna(
+        {'Total PnL': 0, 'Trade Count': 0, 'Win Rate': '0.00%'})
+    # Ensure Trade Count is integer
+    weekday_analysis['Trade Count'] = weekday_analysis['Trade Count'].astype(
+        int)
+
+    print(weekday_analysis)
+# --- END NEW FUNCTION ---

@@ -7,7 +7,7 @@ from ..data.binance_rest import fetch_klines as fetch_spot_klines, fetch_futures
 from ..data.storage import parquet_path, save_bars, load_bars
 from ..backtest.engine import run_multi_asset
 # Import new report function
-from ..backtest.reporting import plot_equity_curve, generate_regime_analysis_report
+from ..backtest.reporting import plot_equity_curve, generate_regime_analysis_report, generate_weekday_analysis_report
 from ..data.binance_futures_rest import fetch_funding_rate
 from ..strategy.ad_mom_spot_future import FinalStrategy
 
@@ -79,10 +79,8 @@ def calculate_adx(df: pd.DataFrame, length: int = 14):
 
 
 def calculate_market_regimes(btc_df: pd.DataFrame):
-    """
-    Calculates volatility and trend regimes using BTC as a market proxy.
-    """
     print("Calculating market regimes using BTCUSDT as proxy...")
+    btc_df = btc_df.copy()  # Avoid SettingWithCopyWarning
     btc_df['returns'] = btc_df['futures_close'].pct_change()
     btc_df['volatility'] = btc_df['returns'].rolling(window=30).std()
     vol_low_q = btc_df['volatility'].quantile(0.25)
@@ -93,13 +91,14 @@ def calculate_market_regimes(btc_df: pd.DataFrame):
     btc_df.loc[btc_df['volatility'] > vol_high_q,
                'volatility_regime'] = 'High Volatility'
 
-    # --- CHANGE: Use the manual ADX calculation ---
+    # Use manual ADX calculation
     btc_df['adx'] = calculate_adx(btc_df, length=30)
-    btc_df['trend_regime'] = 'Weak Trend'  # Default
+    btc_df['trend_regime'] = 'Weak Trend'
     btc_df.loc[btc_df['adx'] > 25, 'trend_regime'] = 'Strong Trend'
     btc_df.loc[btc_df['adx'] < 20, 'trend_regime'] = 'Ranging'
 
-    return btc_df[['ts', 'volatility_regime', 'trend_regime']]
+    # Include adx
+    return btc_df[['ts', 'volatility_regime', 'trend_regime', 'adx']]
 
 
 def main():
@@ -225,8 +224,10 @@ def main():
         plot_equity_curve(res.equity_curve, save_path)
 
     # --- Generate and print the final regime report ---
+
     if not res.trades.empty:
         generate_regime_analysis_report(res.trades)
+        generate_weekday_analysis_report(res.trades)  # Call weekday analysis
 
 
 if __name__ == "__main__":

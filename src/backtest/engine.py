@@ -28,7 +28,8 @@ def run_multi_asset(data: dict[str, pd.DataFrame], strategy, cfg: dict) -> Backt
     equities = []
     trades = []
     all_score_components = []
-    last_rebalance_ts = timeline[0]
+    last_rebalance_ts = timeline[0] if len(
+        timeline) > 0 else pd.Timestamp.now()
 
     for i, ts in enumerate(timeline):
         current_prices = {}
@@ -44,7 +45,31 @@ def run_multi_asset(data: dict[str, pd.DataFrame], strategy, cfg: dict) -> Backt
             s for s in broker.positions if broker.positions[s]['qty'] != 0}
         if all(s in current_prices for s in assets_to_price):
             snap = broker.mark_to_market(current_prices)
-            equities.append({"ts": ts, "equity": snap["equity"]})
+
+            # --- NEW: Capture Daily Regime Data ---
+            # We default to 'Unknown'. Since regimes are market-wide (BTC),
+            # we can take them from any symbol that has data for this day.
+            regimes = {
+                'volatility_regime': 'Unknown',
+                'trend_regime': 'Unknown',
+                'skew_regime': 'Unknown'
+            }
+            if latest_rows:
+                # Grab the first available symbol's data
+                sample_row = next(iter(latest_rows.values()))
+                regimes['volatility_regime'] = sample_row.get(
+                    'volatility_regime', 'Unknown')
+                regimes['trend_regime'] = sample_row.get(
+                    'trend_regime', 'Unknown')
+                regimes['skew_regime'] = sample_row.get(
+                    'skew_regime', 'Unknown')
+
+            equities.append({
+                "ts": ts,
+                "equity": snap["equity"],
+                **regimes  # Unpack to columns: volatility_regime, etc.
+            })
+            # --------------------------------------
 
         if ts < last_rebalance_ts + rebalance_period:
             continue
@@ -59,6 +84,20 @@ def run_multi_asset(data: dict[str, pd.DataFrame], strategy, cfg: dict) -> Backt
             for symbol, components in score_components.items():
                 components['ts'] = ts
                 components['symbol'] = symbol
+                # Add regime data to score components too for cross-sectional analysis
+                latest_row_for_sym = latest_rows.get(symbol)
+                if latest_row_for_sym is not None:
+                    components['volatility_regime'] = latest_row_for_sym.get(
+                        'volatility_regime', 'Unknown')
+                    components['trend_regime'] = latest_row_for_sym.get(
+                        'trend_regime', 'Unknown')
+                    components['skew_regime'] = latest_row_for_sym.get(
+                        'skew_regime', 'Unknown')
+                else:
+                    components['volatility_regime'] = 'Unknown'
+                    components['trend_regime'] = 'Unknown'
+                    components['skew_regime'] = 'Unknown'
+
                 all_score_components.append(components)
 
         if not signals:
@@ -83,36 +122,34 @@ def run_multi_asset(data: dict[str, pd.DataFrame], strategy, cfg: dict) -> Backt
             order: Order = {"symbol": symbol, "side": side,
                             "qty": abs(delta), "order_type": "MARKET"}
 
-            # --- DEFINITIVE FIX: Pass the current regime to the broker ---
             current_row = latest_rows.get(symbol)
             regimes = {
                 'volatility_regime': current_row.get('volatility_regime', 'Unknown'),
-                'trend_regime': current_row.get('trend_regime', 'Unknown')
+                'trend_regime': current_row.get('trend_regime', 'Unknown'),
+                'skew_regime': current_row.get('skew_regime', 'Unknown')
             }
 
             fill = broker.execute(order, last_price, regimes)
 
-            # Record the trade only if PnL was realized (i.e., it was a closing trade)
             if fill.get("pnl", 0.0) != 0.0:
                 trades.append({
                     "ts": ts,
                     "symbol": symbol,
-                    "side": side,  # This is the side of the closing trade
+                    "side": side,
                     "qty": fill["qty"],
                     "price": fill["price"],
                     "pnl": fill["pnl"],
-                    # Regime from the ENTRY
                     "volatility_regime": fill["volatility_regime"],
-                    # Regime from the ENTRY
-                    "trend_regime": fill["trend_regime"]
+                    "trend_regime": fill["trend_regime"],
+                    "skew_regime": fill["skew_regime"]
                 })
 
     if equities:
         eq = pd.DataFrame(equities).drop_duplicates(
             "ts").set_index("ts").sort_index()
     else:
-        eq = pd.DataFrame({'ts': [timeline[0]], 'equity': [
-                          cfg['backtest']['initial_cash']]}).set_index('ts')
+        eq = pd.DataFrame({'ts': [timeline[0] if len(timeline) > 0 else pd.Timestamp.now(
+        )], 'equity': [cfg['backtest']['initial_cash']]}).set_index('ts')
 
     tr = pd.DataFrame(trades)
     score_df = pd.DataFrame(all_score_components)

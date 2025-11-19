@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Tuple
 from ..core.event import SignalEvent
+from .. import factors  # <-- IMPORT ADDED
 
 
 class FinalStrategy:
@@ -11,7 +12,8 @@ class FinalStrategy:
                  smooth_lookback: int = 10,  # New: Lookback for smoothing momentum factors
                  vol_lookback: int = 30,  # New: Lookback for volatility calculation
                  # New: How much volatility adjusts the score (0 to 1)
-                 vol_adj_factor: float = 0.5
+                 vol_adj_factor: float = 0.5,
+                 inverse_in_weak_regime: bool = True  # <-- Added Parameter
                  ):
         self.lookback = lookback
         self.quantile = quantile
@@ -24,6 +26,7 @@ class FinalStrategy:
         self.smooth_lookback = smooth_lookback  # Store smooth lookback
         self.vol_lookback = vol_lookback       # Store volatility lookback
         self.vol_adj_factor = vol_adj_factor   # Store volatility adjustment factor
+        self.inverse_in_weak_regime = inverse_in_weak_regime  # Store setting
 
     def on_rebalance(self, data: Dict[str, pd.DataFrame]) -> Tuple[Dict, Dict]:
         final_scores = {}
@@ -42,27 +45,31 @@ class FinalStrategy:
             if len(df) < required_len:
                 continue
 
-            # --- Momentum Calculations (Raw) ---
-            price_roc_raw = df["futures_close"].pct_change(self.lookback)
-            oi_roc_raw = df["open_interest"].pct_change(self.lookback)
-            close_price = df['futures_close'].iloc[-1]
-            if close_price == 0 or np.isnan(close_price):
-                close_price = 1e-12
-            basis_raw = df["basis"] / close_price
-            basis_momentum_raw = basis_raw.diff(self.lookback)
-            avg_volume_ratio_raw = df["volume_ratio"].rolling(
-                self.lookback).mean()
+            # --- MODIFICATION 1: Use factor functions ---
 
-            # --- MODIFICATION 1: Smooth Momentum Factors ---
-            price_roc = price_roc_raw.rolling(
-                self.smooth_lookback).mean().iloc[-1]
-            oi_roc = oi_roc_raw.rolling(self.smooth_lookback).mean().iloc[-1]
+            # 1. Price Momentum
+            price_roc = factors.calc_price_mom(
+                df, self.lookback, self.smooth_lookback
+            ).iloc[-1]
+            if np.isnan(price_roc):
+                price_roc = 0.0
+
+            # 2. Open Interest Momentum
+            oi_roc = factors.calc_oi_mom(
+                df, self.lookback, self.smooth_lookback
+            ).iloc[-1]
             if np.isnan(oi_roc):
                 oi_roc = 0.0
-            basis_momentum = basis_momentum_raw.rolling(
-                self.smooth_lookback).mean().iloc[-1]
-            # Use the latest rolling average value
-            avg_volume_ratio = avg_volume_ratio_raw.iloc[-1]
+
+            # 3. Basis Momentum
+            basis_momentum = factors.calc_basis_mom(
+                df, self.lookback, self.smooth_lookback
+            ).iloc[-1]
+
+            # 4. Volume Ratio Signal (using our fixed function)
+            avg_volume_ratio = factors.calc_vol_ratio_signal(
+                df, rolling_lookback=self.lookback, diff_lookback=self.lookback
+            ).iloc[-1]
 
             # --- Trend Score ---
             trend_score = price_roc * (1 + 2 * oi_roc)
@@ -75,20 +82,17 @@ class FinalStrategy:
 
             combined_score = trend_score + sentiment_score
 
-            # --- MODIFICATION 2: Calculate Volatility for Adjustment ---
-            daily_returns = df["futures_close"].pct_change()
-            volatility = daily_returns.rolling(
-                self.vol_lookback).std().iloc[-1]
+            # --- MODIFICATION 2: Use factor functions ---
 
-            # --- Funding Rate Z-Score Penalty ---
-            funding_rates = df["funding_rate"].iloc[-self.funding_lookback:]
-            rolling_mean_fr = funding_rates.mean()
-            rolling_std_fr = funding_rates.std()
-            current_funding_rate = df["funding_rate"].iloc[-1]
-            funding_z_score = 0.0
-            if rolling_std_fr is not None and rolling_std_fr != 0 and not np.isnan(rolling_std_fr):
-                funding_z_score = (current_funding_rate -
-                                   rolling_mean_fr) / rolling_std_fr
+            # 5. Volatility
+            volatility = factors.calc_volatility(
+                df, self.vol_lookback
+            ).iloc[-1]
+
+            # 6. Funding Rate Z-Score
+            funding_z_score = factors.calc_funding_zscore(
+                df, self.funding_lookback
+            ).iloc[-1]
 
             funding_penalty = 1.0
             if not np.isnan(combined_score) and not np.isinf(combined_score):
@@ -96,13 +100,27 @@ class FinalStrategy:
                     funding_penalty = 1.5
                 elif (funding_z_score < -self.funding_z_threshold and combined_score < 0):
                     funding_penalty = 1.5
+                elif (funding_z_score < -self.funding_z_threshold and combined_score > 0 or funding_z_score > self.funding_z_threshold and combined_score > 0):
+                    funding_penalty = 0
             else:
                 combined_score = 0.0
+
+            # --- 4. Determine Regime Inversion ---
+            regime_multiplier = 1.0
+            current_regime = "Unknown"
+
+            if "volatility_regime" in df.columns:
+                current_regime = df["volatility_regime"].iloc[-1]
+                # In factors.py: 'Ranging' (ADX<20) and 'Weak Trend' (ADX 20-25)
+                if self.inverse_in_weak_regime and current_regime in ["Low Volatility"]:
+                    regime_multiplier = 0
 
             intermediate_calcs[symbol] = {
                 'combined_score': combined_score if not np.isnan(combined_score) else 0.0,
                 'volatility': volatility if not np.isnan(volatility) else 0.0,
                 'funding_penalty': funding_penalty,
+                'regime_multiplier': regime_multiplier,  # <-- Stored here
+                'current_regime': current_regime,        # <-- Stored here
                 # Store original smoothed components
                 'price_roc': price_roc, 'oi_roc': oi_roc, 'trend_score': trend_score,
                 'basis_momentum': basis_momentum, 'avg_volume_ratio': avg_volume_ratio,
@@ -121,11 +139,15 @@ class FinalStrategy:
         for symbol, calcs in intermediate_calcs.items():
             combined_score = calcs['combined_score']
             funding_penalty = calcs['funding_penalty']
+            regime_multiplier = calcs['regime_multiplier']
             normalized_vol = vol_ranks.get(symbol, 0.5)
 
             # --- MODIFICATION 2 (cont.): Apply Volatility Adjustment ---
             vol_adjustment = max(0, (1 - normalized_vol * self.vol_adj_factor))
-            adjusted_score = combined_score * vol_adjustment
+
+            # Apply regime multiplier: If weak trend, flips sign (Long <-> Short)
+            adjusted_score = combined_score * vol_adjustment * regime_multiplier
+
             final_score = adjusted_score * funding_penalty
 
             final_scores[symbol] = final_score
@@ -142,6 +164,9 @@ class FinalStrategy:
                 'funding_z_score': calcs['funding_z_score'] if not np.isnan(calcs['funding_z_score']) else 0.0,
                 'volatility': calcs['volatility'] if not np.isnan(calcs['volatility']) else 0.0,
                 'vol_adj_factor': vol_adjustment,
+                'regime_multiplier': regime_multiplier,  # <-- Added for reporting
+                # <-- Added for reporting
+                'current_regime': calcs['current_regime'],
                 'final_score_unadjusted': combined_score * funding_penalty if not np.isnan(combined_score) else 0.0,
                 'final_score': final_score if not np.isnan(final_score) else 0.0
             }

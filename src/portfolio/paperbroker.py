@@ -8,9 +8,8 @@ class PaperBroker:
         self.cash = cash
         self.fee_bps = fee_bps
         self.slippage_bps = slippage_bps
-        # --- DEFINITIVE FIX: Position now stores entry regime data ---
-        # symbol -> {'qty': float, 'avg_price': float, 'vol_regime': str, 'trend_regime': str}
-        self.positions = {}
+        # Add skew_regime to position tracking
+        self.positions = {}  # symbol -> {'qty': float, 'avg_price': float, 'vol_regime': str, 'trend_regime': str, 'skew_regime': str}
         self.trades = []
         self.equity_curve = []
 
@@ -29,40 +28,44 @@ class PaperBroker:
         realized_pnl = 0.0
         entry_vol_regime = 'Unknown'
         entry_trend_regime = 'Unknown'
+        entry_skew_regime = 'Unknown'  # New variable
 
         if symbol not in self.positions:
-            self.positions[symbol] = {
-                "qty": 0.0, "avg_price": 0.0, "vol_regime": "Unknown", "trend_regime": "Unknown"}
+            self.positions[symbol] = {"qty": 0.0, "avg_price": 0.0,
+                                      "vol_regime": "Unknown", "trend_regime": "Unknown", "skew_regime": "Unknown"}
 
         current_qty = self.positions[symbol]["qty"]
         avg_price = self.positions[symbol]["avg_price"]
 
-        # --- DEFINITIVE FIX: Store regime when opening a new position ---
         is_new_position = abs(current_qty) < 1e-9
         if is_new_position:
             self.positions[symbol]['vol_regime'] = regimes['volatility_regime']
             self.positions[symbol]['trend_regime'] = regimes['trend_regime']
+            # Store skew regime on entry
+            self.positions[symbol]['skew_regime'] = regimes['skew_regime']
 
         entry_vol_regime = self.positions[symbol]['vol_regime']
         entry_trend_regime = self.positions[symbol]['trend_regime']
+        # Get entry skew regime
+        entry_skew_regime = self.positions[symbol]['skew_regime']
 
         if side == "BUY":
-            if current_qty >= 0:  # Adding to a long or opening a new long
+            if current_qty >= 0:
                 new_avg_price = ((avg_price * current_qty) + (fill_price *
                                  qty_to_trade)) / (current_qty + qty_to_trade)
                 self.positions[symbol]["avg_price"] = new_avg_price
-            else:  # Closing/reducing a short
+            else:
                 qty_to_close = min(qty_to_trade, abs(current_qty))
                 realized_pnl = (avg_price - fill_price) * qty_to_close
                 self.cash += realized_pnl
 
             self.positions[symbol]["qty"] += qty_to_trade
         else:  # SELL
-            if current_qty <= 0:  # Adding to a short or opening a new short
+            if current_qty <= 0:
                 new_avg_price = ((avg_price * abs(current_qty)) + (fill_price *
                                  qty_to_trade)) / (abs(current_qty) + qty_to_trade)
                 self.positions[symbol]["avg_price"] = new_avg_price
-            else:  # Closing/reducing a long
+            else:
                 qty_to_close = min(qty_to_trade, current_qty)
                 realized_pnl = (fill_price - avg_price) * qty_to_close
                 self.cash += realized_pnl
@@ -71,15 +74,15 @@ class PaperBroker:
         if abs(self.positions[symbol]["qty"]) < 1e-9:
             self.positions[symbol]["qty"] = 0.0
             self.positions[symbol]["avg_price"] = 0.0
-            # Reset regimes once position is flat
             self.positions[symbol]['vol_regime'] = 'Unknown'
             self.positions[symbol]['trend_regime'] = 'Unknown'
+            self.positions[symbol]['skew_regime'] = 'Unknown'  # Reset
 
-        # --- DEFINITIVE FIX: Return the entry regimes in the fill event ---
         fill = {
             "symbol": symbol, "qty": qty_to_trade, "price": fill_price, "fee": fee, "pnl": realized_pnl,
             "volatility_regime": entry_vol_regime,
-            "trend_regime": entry_trend_regime
+            "trend_regime": entry_trend_regime,
+            "skew_regime": entry_skew_regime  # Return entry skew regime
         }
         return fill
 

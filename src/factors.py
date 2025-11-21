@@ -5,8 +5,11 @@ import numpy as np
 # --- ADX Calculation (Manual) ---
 
 
-def calculate_adx(df: pd.DataFrame, length: int = 14):
-    """Calculates the Average Directional Index (ADX) manually."""
+def calculate_adx(df: pd.DataFrame, length: int = 30):
+    """
+    Calculates the Average Directional Index (ADX) manually.
+    Expects DataFrame with 'high', 'low', 'futures_close' columns.
+    """
     df_adx = df.copy()
     alpha = 1 / length
 
@@ -52,7 +55,7 @@ def calc_btc_regimes(btc_df: pd.DataFrame):
     btc_df['returns'] = btc_df['futures_close'].pct_change()
 
     # Volatility Regime
-    btc_df['volatility'] = btc_df['returns'].rolling(window=30).std()
+    btc_df['volatility'] = btc_df['returns'].rolling(window=90).std()
     vol_low_q = btc_df['volatility'].quantile(0.25)
     vol_high_q = btc_df['volatility'].quantile(0.75)
     btc_df['volatility_regime'] = 'Medium Volatility'
@@ -69,57 +72,49 @@ def calc_btc_regimes(btc_df: pd.DataFrame):
 
     return btc_df[['ts', 'volatility_regime', 'trend_regime', 'adx']]
 
-# --- Per-Asset Factors (Your Strategy) ---
+# --- Per-Asset Factors (Updated for Vectorization) ---
 
 
-def calc_price_mom(df: pd.DataFrame, lookback: int, smooth_lookback: int):
-    """Smoothed Price Rate of Change"""
-    return df["futures_close"].pct_change(lookback).rolling(smooth_lookback).mean()
+def calc_price_mom(prices, lookback: int, smooth_lookback: int):
+    """Smoothed Price Rate of Change. Accepts Series or DataFrame."""
+    return prices.pct_change(lookback).rolling(smooth_lookback).mean()
 
 
-def calc_oi_mom(df: pd.DataFrame, lookback: int, smooth_lookback: int):
-    """Smoothed Open Interest Rate of Change"""
-    return df["open_interest"].pct_change(lookback).rolling(smooth_lookback).mean()
+def calc_oi_mom(open_interest, lookback: int, smooth_lookback: int):
+    """Smoothed Open Interest Rate of Change. Accepts Series or DataFrame."""
+    return open_interest.pct_change(lookback).rolling(smooth_lookback).mean()
 
 
-def calc_basis_mom(df: pd.DataFrame, lookback: int, smooth_lookback: int):
-    """Smoothed Basis Momentum (Normalized by Price)"""
-    close_price = df['futures_close'].replace(0, 1e-12)
-    basis_norm = df["basis"] / close_price
+def calc_basis_mom(basis, prices, lookback: int, smooth_lookback: int):
+    """Smoothed Basis Momentum. Accepts Series or DataFrame."""
+    # Avoid division by zero
+    safe_prices = prices.replace(0, 1e-12)
+    basis_norm = basis / safe_prices
     return basis_norm.diff(lookback).rolling(smooth_lookback).mean()
 
 
-def calc_vol_ratio_signal(df: pd.DataFrame, rolling_lookback: int, diff_lookback: int):
-    """2^x signal based on diff of rolling avg volume ratio"""
-    # This logic now matches the strategy:
-    # A rolling mean (e.g., 7 days) followed by a diff (e.g., 30 days)
-    vol_ratio_diff = df["volume_ratio"].rolling(
-        rolling_lookback).mean()
+def calc_vol_ratio_signal(volume_ratio, rolling_lookback: int, diff_lookback: int):
+    """2^x signal based on diff of rolling avg volume ratio. Accepts Series or DataFrame."""
+    vol_ratio_diff = volume_ratio.rolling(
+        rolling_lookback).mean().diff(diff_lookback)
 
     # 2^x, default to 1 (2^0) if diff is NaN
-    return vol_ratio_diff
+    return 2 ** vol_ratio_diff.fillna(0.0)
 
 
-def calc_funding_zscore(df: pd.DataFrame, lookback: int):
-    """Time-series Z-score of funding rate"""
-    rates = df["funding_rate"]
-    mean = rates.rolling(lookback).mean()
-    std = rates.rolling(lookback).std().replace(
-        0, 1e-12)  # Avoid division by zero
-    return (rates - mean) / std
+def calc_funding_zscore(funding_rates, lookback: int):
+    """Time-series Z-score of funding rate. Accepts Series or DataFrame."""
+    mean = funding_rates.rolling(lookback).mean()
+    std = funding_rates.rolling(lookback).std().replace(0, 1e-12)
+    return (funding_rates - mean) / std
 
 
-def calc_volatility(df: pd.DataFrame, lookback: int):
-    """Rolling return volatility"""
-    return df["futures_close"].pct_change().rolling(lookback).std()
+def calc_volatility(prices, lookback: int):
+    """Rolling return volatility. Accepts Series or DataFrame."""
+    return prices.pct_change().rolling(lookback).std()
 
 
-def calc_capital_proxy(df: pd.DataFrame, lookback: int):
-    """Rolling average of Open Interest as capital proxy"""
-    return df["open_interest"].rolling(lookback).mean()
-
-
-def calc_skewness(df: pd.DataFrame, lookback: int):
-    """Rolling skewness of daily returns"""
-    returns = df["futures_close"].pct_change()
+def calc_skewness(prices, lookback: int):
+    """Rolling skewness of daily returns. Accepts Series or DataFrame."""
+    returns = prices.pct_change()
     return returns.rolling(window=lookback, min_periods=30).skew()

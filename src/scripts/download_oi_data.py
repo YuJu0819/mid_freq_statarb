@@ -106,8 +106,8 @@ SYMBOLS = [
     "PYTHUSDT",
     "WUSDT",
 ]  # Add all the symbols you need
-START_DATE = date(2024, 1, 1)
-END_DATE = date(2024, 12, 31)
+START_DATE = date(2025, 1, 1)
+END_DATE = date(2025, 11, 1)
 OUTPUT_DIRECTORY = "./data/open_interest"  # Directory to save the CSV files
 # ---------------------
 

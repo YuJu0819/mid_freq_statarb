@@ -55,9 +55,9 @@ def main():
     symbols = cfg["backtest"]["symbols"]
     interval = "1d"
 
-    SKEW_LOOKBACK = 90
-    SKEW_POSITIVE_THRESHOLD = 0.5
-    SKEW_NEGATIVE_THRESHOLD = -0.5
+    SKEW_LOOKBACK = 45
+    SKEW_POSITIVE_THRESHOLD = 0.4
+    SKEW_NEGATIVE_THRESHOLD = -0.2
 
     try:
         print("Preparing BTC data for regime analysis...")
@@ -83,7 +83,7 @@ def main():
     all_data = {}
     for symbol in symbols:
         try:
-            fname_suffix = f"{interval}_{args.start_date}_to_{args.end_date}_skew_analysis_v2_abs"
+            fname_suffix = f"{interval}_{args.start_date}_to_{args.end_date}_skew_analysis_long_factor3"
             ppath = parquet_path(
                 cfg["general"]["parquet_dir"], symbol, fname_suffix)
             df = load_bars(ppath)
@@ -125,8 +125,9 @@ def main():
                 merged_df['volume_ratio'] = merged_df['futures_volume'] / \
                     (merged_df['volume_spot'].replace(0, 1e-12))
 
+                # --- MODIFICATION: Updated to pass the Series directly ---
                 merged_df['skewness'] = factors.calc_skewness(
-                    merged_df, lookback=SKEW_LOOKBACK)
+                    merged_df['futures_close'], lookback=SKEW_LOOKBACK)
 
                 merged_df['skew_regime'] = 'Neutral Skew'
                 merged_df.loc[merged_df['skewness'] <
@@ -192,11 +193,12 @@ def main():
 
         # --- NEW CALL: Generate Daily Regime Analysis ---
         generate_daily_regime_analysis(res.equity_curve)
+        generate_weekday_analysis_report(res.equity_curve)
         plot_daily_regime_pnl_ts(res.equity_curve, report_dir)
     if not res.trades.empty:
         # Keep the trade-based ones too, for comparison
         generate_regime_analysis_report(res.trades)
-        generate_weekday_analysis_report(res.trades)
+        # generate_weekday_analysis_report(res.trades)
         generate_skew_analysis_report(res.trades)
 
 

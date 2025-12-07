@@ -1,8 +1,10 @@
 import pandas as pd
 import numpy as np
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List, Optional
 from ..core.event import SignalEvent
 from .. import factors
+from collections import defaultdict
+MAX_WEIGHT_PER_ASSET = 0.1  # 10% Cap
 
 
 class FinalStrategy:
@@ -12,7 +14,8 @@ class FinalStrategy:
                  smooth_lookback: int = 10,
                  vol_lookback: int = 30,
                  vol_adj_factor: float = 0.5,
-                 inverse_in_weak_regime: bool = True
+                 inverse_in_weak_regime: bool = True,
+                 factor_mask_config: Optional[Dict] = None
                  ):
         self.lookback = lookback
         self.quantile = quantile
@@ -25,23 +28,12 @@ class FinalStrategy:
         self.vol_lookback = vol_lookback
         self.vol_adj_factor = vol_adj_factor
         self.inverse_in_weak_regime = inverse_in_weak_regime
+        self.factor_mask_config = factor_mask_config
 
     def on_rebalance(self, data: Dict[str, pd.DataFrame]) -> Tuple[Dict, Dict]:
         # --- 0. Handle Empty Data ---
         if not data:
             return {}, {}
-
-        # V-- NEW: SUNDAY CHECK TO AVOID MONDAY LOSS --V
-        # # Check the last timestamp of the first available asset
-        # sample_df = next(iter(data.values()))
-        # if not sample_df.empty:
-        #     current_ts_ms = sample_df['ts'].iloc[-1]
-        #     current_date = pd.to_datetime(current_ts_ms, unit='ms')
-        #     # Monday=0, ..., Saturday=5, Sunday=6.
-        #     if current_date.weekday() in [4, 2, 6]:
-        #         signals = {sym: SignalEvent(symbol=sym, weight=0.0) for sym in data.keys()}
-        #         return signals, {}
-        # ^-- END SUNDAY CHECK --^
 
         # --- 2. Construct Aligned Wide DataFrames ---
         # We only need the recent history required for calculation
@@ -125,6 +117,8 @@ class FinalStrategy:
             funding_wide, self.funding_lookback)
         funding_z = funding_z.fillna(0.0)
 
+        sent_z = factors.calc_funding_zscore(sentiment_score, self.lookback)
+        sent_z.fillna(0)
         # --- 4. Vectorized Adjustments (Funding Penalty & Regimes) ---
 
         # Funding Penalty Logic
@@ -137,16 +131,23 @@ class FinalStrategy:
             ((funding_z < -self.funding_z_threshold) & (combined_score < 0))
         )
 
-        # Kill Condition (0.0):
-        # Reference: (funding_z < -self.funding_z_threshold * 1.3 and combined_score > 0) or
-        #            (funding_z > self.funding_z_threshold * 1.3 and combined_score > 0)
         kill_mask = (
-            ((funding_z < -self.funding_z_threshold * 1.3) & (combined_score > 0)) |
-            ((funding_z > self.funding_z_threshold * 1.3) & (combined_score > 0))
+            ((funding_z < -self.funding_z_threshold * 2) & (combined_score > 0)) |
+            ((funding_z > self.funding_z_threshold * 2) & (combined_score < 0)
+             ) | abs(funding_z < self.funding_z_threshold * 0.1)
         )
 
         funding_penalty[boost_mask] = 1.5
-        funding_penalty[kill_mask] = 0.0
+        funding_penalty[kill_mask] = 0.5
+
+        sent_penalty = pd.DataFrame(
+            1.0, index=combined_score.index, columns=combined_score.columns)
+
+        # Boost Condition (1.5): (Z > Th and Score > 0) OR (Z < -Th and Score < 0)
+        boost_mask = (
+            (abs(sent_z) < 1)
+        )
+        sent_penalty[boost_mask] = 1.5
 
         active_volatility = volatility.replace(0.0, np.nan)
 
@@ -159,57 +160,16 @@ class FinalStrategy:
         # (Matches reference: defaults to 1.0, logic commented out)
         regime_multiplier = pd.DataFrame(
             1.0, index=trend_score.index, columns=trend_score.columns)
-        # if self.inverse_in_weak_regime:
-        #     # Example vectorized logic if you enable it later:
-        #     # vol_regime_wide = pd.DataFrame(vol_regime_dict).ffill()
-        #     # weak_mask = vol_regime_wide.isin(["Low Volatility"])
-        #     # regime_multiplier[weak_mask] = 0.0
-        #     pass
 
         # Final Score Calculation
         adjusted_score = combined_score * vol_adjustment * regime_multiplier
-        final_score = adjusted_score * funding_penalty
+        final_score = adjusted_score * funding_penalty * sent_penalty
 
         # --- 5. Signal Generation (Current Timestamp) ---
         current_scores = final_score.iloc[-1].dropna()
 
         if current_scores.empty:
             return {}, {}
-
-        # Ranking
-        ranked_scores = current_scores.sort_values(ascending=False)
-        symbols = ranked_scores.index.tolist()
-        n_assets = len(symbols)
-
-        long_cutoff = int(n_assets * self.quantile)
-        short_cutoff = int(n_assets * (1 - self.quantile))
-
-        longs = symbols[:long_cutoff]
-        shorts = symbols[short_cutoff:]
-
-        signals = {}
-        long_weight_scale = 0.5
-        short_weight_scale = 0.5
-
-        # Long Weights
-        if longs:
-            long_denom = sum(len(longs) - i for i in range(len(longs))) or 1
-            for i, sym in enumerate(longs):
-                w = long_weight_scale * (len(longs) - i) / long_denom
-                signals[sym] = SignalEvent(symbol=sym, weight=w)
-
-        # Short Weights
-        if shorts:
-            short_denom = sum(i + 1 for i in range(len(shorts))) or 1
-            for i, sym in enumerate(shorts):
-                w = -short_weight_scale * (i + 1) / short_denom
-                signals[sym] = SignalEvent(symbol=sym, weight=w)
-
-        # Zero others
-        active_syms = set(longs + shorts)
-        for sym in data.keys():
-            if sym not in active_syms:
-                signals[sym] = SignalEvent(symbol=sym, weight=0.0)
 
         # --- 6. Construct Score Components (For Reporting) ---
         idx = -1
@@ -237,5 +197,101 @@ class FinalStrategy:
                 'final_score_unadjusted': (get_val(combined_score, sym) * get_val(funding_penalty, sym)),
                 'final_score': current_scores[sym]
             }
+            # --- 7. Ranking and Filtering ---
+        ranked_scores = current_scores.sort_values(ascending=False)
+        symbols = ranked_scores.index.tolist()
+
+        long_cutoff = int(len(symbols) * self.quantile)
+        short_cutoff = int(len(symbols) * (1 - self.quantile))
+
+        raw_longs = symbols[:long_cutoff]
+        raw_shorts = symbols[short_cutoff:]
+
+        # --- V-- FIXED EXPERIMENTAL FILTERING --V ---
+
+        # 1. Initialize Score Maps (Default to 0)
+        # These track how many filters each asset passed.
+        long_counts = defaultdict(int)
+        short_counts = defaultdict(int)
+
+        has_mask_config = bool(self.factor_mask_config)
+
+        if has_mask_config:
+            # Normalize to list
+            configs = self.factor_mask_config if isinstance(
+                self.factor_mask_config, list) else [self.factor_mask_config]
+
+            for conf in configs:
+                mask_factor = conf.get('factor')
+                keep_quantiles = conf.get('quantiles', [])
+                n_bins = conf.get('n_bins', 5)
+
+                # Extract factor values
+                factor_vals = pd.Series(
+                    {s: score_components[s].get(mask_factor, 0.0) for s in symbols})
+
+                if not factor_vals.empty:
+                    # Rank
+                    ranks = factor_vals.rank(method='first', pct=True)
+                    q_labels = np.ceil(ranks * n_bins).astype(int)
+
+                    # Count Matches (Boost Score)
+                    for sym in raw_longs:
+                        if sym in q_labels and q_labels[sym] in keep_quantiles:
+                            long_counts[sym] += 1
+
+                    for sym in raw_shorts:
+                        if sym in q_labels and q_labels[sym] in keep_quantiles:
+                            short_counts[sym] += 1
+                else:
+                    # If a factor is missing, we just skip it (don't increment, but DON'T reset)
+                    pass
+
+        # --- 8. Assign Weights ---
+        signals = {}
+        long_weight_scale = 0.5
+        short_weight_scale = 0.5
+
+        def assign_normalized_weights(assets, target_total_exposure, counts_map, is_long=True):
+            if not assets:
+                return
+            raw_scores = {}
+            for i, sym in enumerate(assets):
+                rank_component = (len(assets) - i) if is_long else (i + 1)
+                mask_multiplier = 1  # Penalize (Default)
+                if has_mask_config:
+                    if counts_map[sym] > 0:
+
+                        mask_multiplier = counts_map[sym] - 0.5
+                raw_scores[sym] = rank_component * mask_multiplier
+
+            total_raw_score = sum(raw_scores.values())
+
+            if total_raw_score == 0:
+                return
+
+            for sym, score in raw_scores.items():
+                # Normalize
+                weight = (score / total_raw_score) * target_total_exposure
+
+                final_weight = min(weight, MAX_WEIGHT_PER_ASSET)
+
+                # Set Signal
+                signals[sym] = SignalEvent(
+                    symbol=sym, weight=final_weight if is_long else -final_weight)
+
+        # Apply to Longs
+        assign_normalized_weights(
+            raw_longs, long_weight_scale, long_counts, is_long=True)
+
+        # Apply to Shorts
+        assign_normalized_weights(
+            raw_shorts, short_weight_scale, short_counts, is_long=False)
+
+        # --- 9. Fill Zeros for Others ---
+        active_syms = set(signals.keys())
+        for sym in data.keys():
+            if sym not in active_syms:
+                signals[sym] = SignalEvent(symbol=sym, weight=0.0)
 
         return signals, score_components

@@ -2,6 +2,7 @@ import pandas as pd
 from dataclasses import dataclass
 from ..core.types import Order
 from ..portfolio.paperbroker import PaperBroker
+import numpy as np  # Added for NaN handling
 
 
 @dataclass
@@ -43,19 +44,18 @@ def run_multi_asset(data: dict[str, pd.DataFrame], strategy, cfg: dict) -> Backt
 
         assets_to_price = {
             s for s in broker.positions if broker.positions[s]['qty'] != 0}
+
+        # --- Market to Market ---
         if all(s in current_prices for s in assets_to_price):
             snap = broker.mark_to_market(current_prices)
 
-            # --- NEW: Capture Daily Regime Data ---
-            # We default to 'Unknown'. Since regimes are market-wide (BTC),
-            # we can take them from any symbol that has data for this day.
+            # Capture Daily Regime Data
             regimes = {
                 'volatility_regime': 'Unknown',
                 'trend_regime': 'Unknown',
                 'skew_regime': 'Unknown'
             }
             if latest_rows:
-                # Grab the first available symbol's data
                 sample_row = next(iter(latest_rows.values()))
                 regimes['volatility_regime'] = sample_row.get(
                     'volatility_regime', 'Unknown')
@@ -67,9 +67,8 @@ def run_multi_asset(data: dict[str, pd.DataFrame], strategy, cfg: dict) -> Backt
             equities.append({
                 "ts": ts,
                 "equity": snap["equity"],
-                **regimes  # Unpack to columns: volatility_regime, etc.
+                **regimes
             })
-            # --------------------------------------
 
         if ts < last_rebalance_ts + rebalance_period:
             continue
@@ -84,7 +83,8 @@ def run_multi_asset(data: dict[str, pd.DataFrame], strategy, cfg: dict) -> Backt
             for symbol, components in score_components.items():
                 components['ts'] = ts
                 components['symbol'] = symbol
-                # Add regime data to score components too for cross-sectional analysis
+
+                # --- REGIMES ---
                 latest_row_for_sym = latest_rows.get(symbol)
                 if latest_row_for_sym is not None:
                     components['volatility_regime'] = latest_row_for_sym.get(
@@ -97,6 +97,13 @@ def run_multi_asset(data: dict[str, pd.DataFrame], strategy, cfg: dict) -> Backt
                     components['volatility_regime'] = 'Unknown'
                     components['trend_regime'] = 'Unknown'
                     components['skew_regime'] = 'Unknown'
+
+                # --- V-- NEW: INJECT POSITION & PRICE FOR PNL ANALYSIS --V ---
+                # This allows us to calculate exactly how much PnL this asset generates
+                current_pos = broker.positions.get(symbol, {})
+                components['position_qty'] = current_pos.get('qty', 0.0)
+                components['close_price'] = current_prices.get(symbol, np.nan)
+                # -------------------------------------------------------------
 
                 all_score_components.append(components)
 

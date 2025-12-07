@@ -1,41 +1,30 @@
 # src/factors.py
 import pandas as pd
 import numpy as np
+from typing import Dict
 
-# --- ADX Calculation (Manual) ---
 
-
-def calculate_adx(df: pd.DataFrame, length: int = 30):
-    """
-    Calculates the Average Directional Index (ADX) manually.
-    Expects DataFrame with 'high', 'low', 'futures_close' columns.
-    """
+def calculate_adx(df: pd.DataFrame, length: int = 14):
     df_adx = df.copy()
     alpha = 1 / length
-
-    # Ensure columns exist, use defaults if not (for robustness)
     high = df_adx.get('high', df_adx['futures_close'])
     low = df_adx.get('low', df_adx['futures_close'])
     close = df_adx['futures_close']
-
     df_adx['h-l'] = high - low
     df_adx['h-pc'] = abs(high - close.shift(1))
     df_adx['l-pc'] = abs(low - close.shift(1))
     df_adx['tr'] = df_adx[['h-l', 'h-pc', 'l-pc']].max(axis=1)
-
     df_adx['dm_plus'] = (high - high.shift(1))
     df_adx['dm_minus'] = (low.shift(1) - low)
     df_adx['dm_plus'] = df_adx['dm_plus'].where(
         (df_adx['dm_plus'] > df_adx['dm_minus']) & (df_adx['dm_plus'] > 0), 0)
     df_adx['dm_minus'] = df_adx['dm_minus'].where(
         (df_adx['dm_minus'] > df_adx['dm_plus']) & (df_adx['dm_minus'] > 0), 0)
-
     df_adx['atr'] = df_adx['tr'].ewm(alpha=alpha, adjust=False).mean()
     df_adx['dm_plus_smoothed'] = df_adx['dm_plus'].ewm(
         alpha=alpha, adjust=False).mean()
     df_adx['dm_minus_smoothed'] = df_adx['dm_minus'].ewm(
         alpha=alpha, adjust=False).mean()
-
     di_plus = 100 * (df_adx['dm_plus_smoothed'] /
                      df_adx['atr'].replace(0, 1e-12))
     di_minus = 100 * (df_adx['dm_minus_smoothed'] /
@@ -43,78 +32,112 @@ def calculate_adx(df: pd.DataFrame, length: int = 30):
     di_sum = (di_plus + di_minus).replace(0, 1e-12)
     dx = 100 * (abs(di_plus - di_minus) / di_sum)
     adx = dx.ewm(alpha=alpha, adjust=False).mean()
-
     return adx
 
-# --- Regime / Environment Factors ---
 
+def calc_market_regimes(market_data: Dict[str, pd.DataFrame]):
+    """
+    Calculates market-wide regimes (vol, trend, skew) using an equal-weighted 
+    basket of assets (e.g., BTC, ETH, SOL) as the proxy.
+    """
+    returns_list = []
+    adx_list = []
 
-def calc_btc_regimes(btc_df: pd.DataFrame):
-    """Calculates market-wide regimes (vol & trend) using BTC as proxy."""
-    btc_df = btc_df.copy()
-    btc_df['returns'] = btc_df['futures_close'].pct_change()
+    for sym, df in market_data.items():
+        if df.empty:
+            continue
+        ret = df['futures_close'].pct_change()
+        ret.name = sym
+        returns_list.append(ret)
 
-    # Volatility Regime
-    btc_df['volatility'] = btc_df['returns'].rolling(window=90).std()
-    vol_low_q = btc_df['volatility'].quantile(0.25)
-    vol_high_q = btc_df['volatility'].quantile(0.75)
-    btc_df['volatility_regime'] = 'Medium Volatility'
-    btc_df.loc[btc_df['volatility'] < vol_low_q,
-               'volatility_regime'] = 'Low Volatility'
-    btc_df.loc[btc_df['volatility'] > vol_high_q,
-               'volatility_regime'] = 'High Volatility'
+        adx = calculate_adx(df, length=14)
+        adx.name = sym
+        adx_list.append(adx)
 
-    # Trend Regime
-    btc_df['adx'] = calculate_adx(btc_df, length=14)
-    btc_df['trend_regime'] = 'Weak Trend'
-    btc_df.loc[btc_df['adx'] > 25, 'trend_regime'] = 'Strong Trend'
-    btc_df.loc[btc_df['adx'] < 20, 'trend_regime'] = 'Ranging'
+    if not returns_list:
+        return pd.DataFrame()
 
-    return btc_df[['ts', 'volatility_regime', 'trend_regime', 'adx']]
+    # 2. Create Aggregated Market Metrics
+    returns_df = pd.concat(returns_list, axis=1)
+    market_returns = returns_df.mean(axis=1)
 
-# --- Per-Asset Factors (Updated for Vectorization) ---
+    adx_df = pd.concat(adx_list, axis=1)
+    market_adx = adx_df.mean(axis=1)
+
+    # 3. Calculate Regime Indicators
+    # FIX: Initialize with None for name to avoid conflict, then reset_index later
+    regimes_df = pd.DataFrame(index=market_returns.index)
+
+    # Volatility
+    volatility = market_returns.rolling(window=30).std()
+    vol_low_q = volatility.quantile(0.25)
+    vol_high_q = volatility.quantile(0.75)
+
+    regimes_df['volatility_regime'] = 'Medium Volatility'
+    regimes_df.loc[volatility < vol_low_q,
+                   'volatility_regime'] = 'Low Volatility'
+    regimes_df.loc[volatility > vol_high_q,
+                   'volatility_regime'] = 'High Volatility'
+
+    # Trend
+    regimes_df['adx'] = market_adx
+    regimes_df['trend_regime'] = 'Weak Trend'
+    regimes_df.loc[market_adx > 25, 'trend_regime'] = 'Strong Trend'
+    regimes_df.loc[market_adx < 20, 'trend_regime'] = 'Ranging'
+
+    # Skew
+    skewness = market_returns.rolling(window=90).skew()
+    regimes_df['skew_regime'] = 'Neutral Skew'
+    regimes_df.loc[skewness < -0.5, 'skew_regime'] = 'Negative Skew'
+    regimes_df.loc[skewness > 0.5, 'skew_regime'] = 'Positive Skew'
+
+    # FIX: Cleanly convert index to column to remove ambiguity
+    regimes_df = regimes_df.reset_index()
+
+    # Ensure the time column is named 'ts'
+    # If the index was unnamed, reset_index creates 'index'. If named 'ts', it creates 'ts'.
+    if 'ts' not in regimes_df.columns:
+        # Assuming the first column is the time index
+        regimes_df.rename(columns={regimes_df.columns[0]: 'ts'}, inplace=True)
+
+    return regimes_df[['ts', 'volatility_regime', 'trend_regime', 'skew_regime', 'adx']]
+
+# --- Per-Asset Factors (Unchanged) ---
 
 
 def calc_price_mom(prices, lookback: int, smooth_lookback: int):
-    """Smoothed Price Rate of Change. Accepts Series or DataFrame."""
     return prices.pct_change(lookback).rolling(smooth_lookback).mean()
 
 
 def calc_oi_mom(open_interest, lookback: int, smooth_lookback: int):
-    """Smoothed Open Interest Rate of Change. Accepts Series or DataFrame."""
     return open_interest.pct_change(lookback).rolling(smooth_lookback).mean()
 
 
 def calc_basis_mom(basis, prices, lookback: int, smooth_lookback: int):
-    """Smoothed Basis Momentum. Accepts Series or DataFrame."""
-    # Avoid division by zero
+    # Fix: Fill NaNs in basis with 0.0 to prevent one missing spot day from killing momentum
+    clean_basis = basis.fillna(0.0)
     safe_prices = prices.replace(0, 1e-12)
-    basis_norm = basis / safe_prices
-    return basis_norm.diff(lookback).rolling(smooth_lookback).mean()
+    basis_norm = clean_basis / safe_prices
+    return basis_norm.diff(lookback).rolling(smooth_lookback, min_periods=1).mean().fillna(0.0)
 
 
 def calc_vol_ratio_signal(volume_ratio, rolling_lookback: int, diff_lookback: int):
-    """2^x signal based on diff of rolling avg volume ratio. Accepts Series or DataFrame."""
     vol_ratio_diff = volume_ratio.rolling(
         rolling_lookback).mean().diff(diff_lookback)
-
-    # 2^x, default to 1 (2^0) if diff is NaN
     return 2 ** vol_ratio_diff.fillna(0.0)
 
 
 def calc_funding_zscore(funding_rates, lookback: int):
-    """Time-series Z-score of funding rate. Accepts Series or DataFrame."""
-    mean = funding_rates.rolling(lookback).mean()
-    std = funding_rates.rolling(lookback).std().replace(0, 1e-12)
+    mean = funding_rates.rolling(lookback, min_periods=20).mean()
+    std = funding_rates.rolling(
+        lookback, min_periods=20).std().replace(0, 1e-12)
     return (funding_rates - mean) / std
 
 
 def calc_volatility(prices, lookback: int):
-    """Rolling return volatility. Accepts Series or DataFrame."""
     return prices.pct_change().rolling(lookback).std()
 
 
 def calc_skewness(prices, lookback: int):
-    """Rolling skewness of daily returns. Accepts Series or DataFrame."""
     returns = prices.pct_change()
     return returns.rolling(window=lookback, min_periods=30).skew()

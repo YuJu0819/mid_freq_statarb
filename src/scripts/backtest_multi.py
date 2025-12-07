@@ -1,16 +1,20 @@
 import argparse
 import os
+import time
+import glob
 import pandas as pd
 from binance.exceptions import BinanceAPIException
 from ..core.utils import load_config
-from ..data.binance_rest import fetch_klines as fetch_spot_klines, fetch_futures_klines
+from ..data.binance_rest import fetch_klines as fetch_spot_klines
+from ..data.binance_futures_rest import fetch_futures_klines
 from ..data.storage import parquet_path, save_bars, load_bars
 from ..backtest.engine import run_multi_asset
 from ..backtest.reporting import (
     plot_equity_curve, generate_regime_analysis_report,
     generate_weekday_analysis_report, generate_skew_analysis_report,
     generate_daily_regime_analysis,  # <-- IMPORTED
-    plot_cross_sectional_analysis, plot_daily_regime_pnl_ts
+    plot_cross_sectional_analysis, plot_daily_regime_pnl_ts, analyze_factor_quantiles,
+    generate_predictive_regime_analysis
 )
 from ..data.binance_futures_rest import fetch_funding_rate
 from ..strategy.ad_mom_spot_future import FinalStrategy
@@ -44,7 +48,48 @@ def load_local_oi_data(symbol, start_date, end_date, data_dir="./data/open_inter
     return oi_df
 
 
+def normalize_spot_symbol(futures_symbol: str) -> str:
+    """
+    Converts a Binance Futures symbol to its corresponding Spot symbol.
+    Handles the '1000' prefix (e.g., 1000PEPEUSDT -> PEPEUSDT).
+    """
+    # 1. Handle standard "1000" prefix for meme coins
+    if futures_symbol.startswith("1000"):
+        return futures_symbol[4:]
+
+    # 2. Handle specific edge cases if any (e.g. LUNA/LUNC confusion in the past)
+    # Most of the time, just stripping 1000 is enough.
+
+    return futures_symbol
+
+# --- 1. SYMBOL DISCOVERY ---
+
+
+def discover_symbols(data_dir: str) -> list[str]:
+    if not os.path.exists(data_dir):
+        return []
+    pattern = os.path.join(data_dir, "*-metrics-*.csv")
+    files = glob.glob(pattern)
+    unique_symbols = set()
+    for f in files:
+        filename = os.path.basename(f)
+        try:
+            parts = filename.split("-metrics-")
+            if len(parts) > 1:
+                unique_symbols.add(parts[0])
+        except Exception:
+            continue
+    return sorted(list(unique_symbols))
+
+
 def main():
+    mask_configs = [
+        # Rule 1: Keep Q5 (Top 20%) of Trend Score (Momentum)
+        {'factor': 'funding_z_score', 'quantiles': [1], 'n_bins': 3},
+
+        # Rule 2: Keep Q1-Q3 (Bottom 60%) of Volatility (Safety)
+        # {'factor': 'basis_momentum', 'quantiles': [2], 'n_bins': 3}
+    ]
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--start_date", help="Start date in YYYY-MM-DD format", required=True)
@@ -55,25 +100,41 @@ def main():
     symbols = cfg["backtest"]["symbols"]
     interval = "1d"
 
-    SKEW_LOOKBACK = 45
-    SKEW_POSITIVE_THRESHOLD = 0.4
-    SKEW_NEGATIVE_THRESHOLD = -0.2
-
+    # --- Step 1: Prepare Market Regime Data (Basket Proxy) ---
     try:
-        print("Preparing BTC data for regime analysis...")
-        spot_btc = fetch_spot_klines(
-            "BTCUSDT", interval, args.start_date, args.end_date)
-        futures_btc = fetch_futures_klines(
-            "BTCUSDT", interval, args.start_date, args.end_date)
-        if spot_btc.empty or futures_btc.empty:
-            raise ValueError("Could not fetch BTC data for regime analysis.")
-        btc_df = pd.merge(spot_btc, futures_btc, on='ts',
-                          suffixes=('_spot', '_futures'))
-        btc_df['ts'] = pd.to_datetime(btc_df['ts'], unit='ms')
-        btc_df.rename(columns={'close_futures': 'futures_close',
-                               'high_futures': 'high', 'low_futures': 'low'}, inplace=True)
+        print("Preparing Market Proxy Data (BTC + ETH + SOL) for regime analysis...")
+        proxy_symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        proxy_data = {}
 
-        market_regimes_df = factors.calc_btc_regimes(btc_df)
+        for sym in proxy_symbols:
+            print(f"Fetching proxy data for {sym}...")
+            spot_df = fetch_spot_klines(
+                sym, interval, args.start_date, args.end_date)
+            futures_df = fetch_futures_klines(
+                sym, interval, args.start_date, args.end_date)
+
+            if spot_df.empty or futures_df.empty:
+                print(
+                    f"Warning: Could not fetch proxy data for {sym}. Skipping.")
+                continue
+
+            # Merge spot/futures to get 'futures_close' aligned with timestamps
+            merged = pd.merge(spot_df, futures_df, on='ts',
+                              suffixes=('_spot', '_futures'))
+            merged['ts'] = pd.to_datetime(merged['ts'], unit='ms')
+            merged.rename(columns={'close_futures': 'futures_close',
+                                   'high_futures': 'high',
+                                   'low_futures': 'low'}, inplace=True)
+            # Set index for alignment in factors.py
+            merged.set_index('ts', inplace=True)
+            proxy_data[sym] = merged
+
+        if not proxy_data:
+            raise ValueError("No proxy data available to calculate regimes.")
+
+        # Calculate Market-Wide Regimes (Vol, Trend, Skew) based on the Basket
+        market_regimes_df = factors.calc_market_regimes(proxy_data)
+        print("Market Regimes Calculated Successfully.")
 
     except Exception as e:
         print(
@@ -81,16 +142,22 @@ def main():
         return
 
     all_data = {}
-    for symbol in symbols:
+    for i, symbol in enumerate(symbols):
+        print(f"[{i+1}/{len(symbols)}] Processing {symbol}...")
+
+        # --- V-- CRITICAL FIX: THROTTLE --V ---
+        time.sleep(1.0)  # Prevent API Ban
+        # --------------------------------------
         try:
-            fname_suffix = f"{interval}_{args.start_date}_to_{args.end_date}_skew_analysis_long_factor3"
+            fname_suffix = f"{interval}_{args.start_date}_to_{args.end_date}_api_safety"
             ppath = parquet_path(
                 cfg["general"]["parquet_dir"], symbol, fname_suffix)
             df = load_bars(ppath)
             if df is None or len(df) == 0:
                 print(f"Processing data for {symbol}...")
+                spot_symbol = normalize_spot_symbol(symbol)
                 spot_df = fetch_spot_klines(
-                    symbol, interval, args.start_date, args.end_date)
+                    spot_symbol, interval, args.start_date, args.end_date)
                 futures_df = fetch_futures_klines(
                     symbol, interval, args.start_date, args.end_date)
                 if spot_df.empty or futures_df.empty:
@@ -115,8 +182,12 @@ def main():
                 if not fr_df.empty:
                     merged_df = pd.merge_asof(
                         merged_df, fr_df.sort_values('ts'), on='ts')
+
+                # --- MODIFICATION: Merge Market-Wide Regimes ---
+                # Now merging Volatility, Trend, AND Skew regimes from the proxy
                 merged_df = pd.merge_asof(merged_df.sort_values(
                     'ts'), market_regimes_df.sort_values('ts'), on='ts')
+                # -----------------------------------------------
 
                 merged_df.rename(columns={
                                  'close_futures': 'futures_close', 'volume_futures': 'futures_volume'}, inplace=True)
@@ -125,15 +196,11 @@ def main():
                 merged_df['volume_ratio'] = merged_df['futures_volume'] / \
                     (merged_df['volume_spot'].replace(0, 1e-12))
 
-                # --- MODIFICATION: Updated to pass the Series directly ---
-                merged_df['skewness'] = factors.calc_skewness(
-                    merged_df['futures_close'], lookback=SKEW_LOOKBACK)
-
-                merged_df['skew_regime'] = 'Neutral Skew'
-                merged_df.loc[merged_df['skewness'] <
-                              SKEW_NEGATIVE_THRESHOLD, 'skew_regime'] = 'Negative Skew'
-                merged_df.loc[merged_df['skewness'] >
-                              SKEW_POSITIVE_THRESHOLD, 'skew_regime'] = 'Positive Skew'
+                # We still calculate per-asset skewness if needed for factors,
+                # but the 'skew_regime' column is now already populated by the merge above.
+                # If you want to use per-asset skew as a factor, you can keep this:
+                merged_df['asset_skewness'] = factors.calc_skewness(
+                    merged_df['futures_close'], lookback=90)
 
                 for col in ['open_interest', 'funding_rate', 'basis', 'volume_ratio', 'volatility_regime', 'trend_regime', 'adx', 'skew_regime']:
                     if col not in merged_df.columns:
@@ -153,15 +220,15 @@ def main():
             all_data[symbol] = df
         except Exception as e:
             print(f"An unexpected error occurred for {symbol}: {e}. Skipping.")
-
+        time.sleep(0.5)
     if not all_data:
         print("No data was successfully loaded. Exiting backtest.")
         return
 
-    strat = FinalStrategy(lookback=30, quantile=0.1, min_volume_usd=10_000_000,
-                          funding_lookback=180, funding_z_threshold=1, trend_ma_length=30,
+    strat = FinalStrategy(lookback=30, quantile=0.4, min_volume_usd=10_000_000,
+                          funding_lookback=180, funding_z_threshold=1.5, trend_ma_length=30,
                           smooth_lookback=10, vol_lookback=30, vol_adj_factor=0.5,
-                          inverse_in_weak_regime=True)  # Using our new inverse setting
+                          inverse_in_weak_regime=True)
 
     res = run_multi_asset(all_data, strat, cfg)
 
@@ -191,15 +258,37 @@ def main():
             report_dir, f"equity_curve_{start_str}_to_{end_str}.png")
         plot_equity_curve(res.equity_curve, save_path)
 
-        # --- NEW CALL: Generate Daily Regime Analysis ---
         generate_daily_regime_analysis(res.equity_curve)
-        generate_weekday_analysis_report(res.equity_curve)
+        generate_predictive_regime_analysis(res.equity_curve)  # <-- NEW CALL
         plot_daily_regime_pnl_ts(res.equity_curve, report_dir)
+
     if not res.trades.empty:
-        # Keep the trade-based ones too, for comparison
         generate_regime_analysis_report(res.trades)
-        # generate_weekday_analysis_report(res.trades)
+
+        if not res.equity_curve.empty:
+            generate_weekday_analysis_report(res.equity_curve)
+
         generate_skew_analysis_report(res.trades)
+
+        # --- V-- NEW: GENERALIZED FACTOR ANALYSIS TOOL --V ---
+        print("\n==== Cross-Sectional Factor Analysis ====")
+        # Pass the score_history, the raw data dictionary, and the column name to analyze
+        # You can add any column found in your score_components here!
+
+        factors_to_analyze = [
+            'trend_score',      # Does high trend score actually predict returns?
+            'volatility',       # Do high vol assets underperform?
+            'funding_z_score',  # Is mean reversion real for funding?
+            'basis_momentum',    # Does basis mom work?
+            'sentiment_score'
+        ]
+        for factor in factors_to_analyze:
+            analyze_factor_quantiles(
+                score_df=res.score_history,
+                factor_name=factor,
+                quantiles=3,
+                report_dir=report_dir
+            )
 
 
 if __name__ == "__main__":

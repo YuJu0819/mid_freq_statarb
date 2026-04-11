@@ -5,7 +5,7 @@ from ..core.utils import load_config
 from ..data.binance_rest import fetch_klines
 # <-- Import the new broker
 from ..portfolio.binance_futures_broker import BinanceFuturesBroker
-from ..strategy.advanced_momentum import AdvancedMomentumStrategy
+from ..strategy.ad_mom_spot_future import FinalStrategy
 from ..core.logger import get_logger
 
 logger = get_logger("live_multi_futures")
@@ -84,12 +84,12 @@ async def run_live_multi_futures(cfg: dict, strategy):
 
 def main():
     cfg = load_config()
-    strategy = AdvancedMomentumStrategy(
+    strategy = FinalStrategy(
         lookback=90,
         quantile=0.2,
         min_volume_usd=10_000_000,
         funding_lookback=14,
-        funding_threshold=0.0025
+        funding_z_threshold=0.0025
     )
     asyncio.run(run_live_multi_futures(cfg, strategy))
 

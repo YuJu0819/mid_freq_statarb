@@ -376,7 +376,11 @@ def analyze_factor_quantiles_pure_return(score_df: pd.DataFrame, data_dict: dict
 def analyze_factor_quantiles(score_df: pd.DataFrame, factor_name: str, quantiles: int = 5, report_dir: str = "."):
     """
     Groups *TRADED* assets into quantiles based on 'factor_name' and plots their 
-    FORWARD PnL CONTRIBUTION.
+    FORWARD RETURN CONTRIBUTION.
+
+    Robust to both:
+    - Vectorized Backtest (qty = Weight) -> Uses Weight * Return
+    - Event-Driven Backtest (qty = Units) -> Uses Units * Price_Diff (Dollar PnL)
     """
     # Check required columns
     required = [factor_name, 'position_qty', 'close_price', 'symbol', 'ts']
@@ -398,29 +402,38 @@ def analyze_factor_quantiles(score_df: pd.DataFrame, factor_name: str, quantiles
     factor_wide = pivot_col(factor_name).abs()
     qty_wide = pivot_col('position_qty').fillna(0.0)
     price_wide = pivot_col('close_price')
-    result = (factor_wide.notna() & (factor_wide != 0)).sum(axis=1)
 
-    # --- V-- NEW: FILTER MASK --V ---
-    # Identify assets that were actually held (Long or Short)
+    # 2. Determine Calculation Mode (Weights vs Units)
+    # If max quantity is small (e.g. < 2.0), it's likely weights from vectorized backtest
+    is_vectorized_weights = qty_wide.abs().max().max() < 5.0
+
+    # 3. Calculate Performance Contribution
+    if is_vectorized_weights:
+        # MODE A: Percentage Contribution (Weight * Return)
+        # Returns: (P_t+1 / P_t) - 1
+        asset_returns = price_wide.pct_change().shift(-1)
+        # Contribution: Weight_t * Return_t+1
+        performance_contribution = qty_wide * asset_returns
+        y_label = "Cumulative Return Contribution (Points)"
+        print("   [Mode] Detected Weights. Calculating Percentage Contribution.")
+    else:
+        # MODE B: Dollar PnL (Units * Price_Diff)
+        # Price Diff: P_t+1 - P_t
+        price_diff = price_wide.diff().shift(-1)
+        # PnL: Units_t * PriceDiff_t+1
+        performance_contribution = qty_wide * price_diff
+        y_label = "Cumulative PnL (USDT)"
+        print("   [Mode] Detected Units. Calculating Dollar PnL.")
+
+    # 4. Filter: Only rank assets that were actually traded
     is_traded = qty_wide != 0
-
-    # Mask the factor matrix.
-    # Values where is_traded is False become NaN.
-    # Pandas rank() ignores NaNs, so we effectively rank ONLY the traded subset.
     factor_wide_traded = factor_wide.where(is_traded)
-    # --------------------------------
 
-    # 2. Calculate Forward PnL per Asset
-    price_diff = price_wide.diff().shift(-1)
-    asset_forward_pnl = qty_wide * price_diff
-
-    # 3. Quantile Bucket Analysis
-    # Rank only the survivors
+    # 5. Quantile Bucket Analysis
     ranks = factor_wide_traded.rank(axis=1, pct=True)
 
     stats_list = []
     plt.figure(figsize=(12, 7))
-
     colors = plt.cm.RdYlGn(np.linspace(0, 1, quantiles))
 
     for q in range(quantiles):
@@ -432,36 +445,37 @@ def analyze_factor_quantiles(score_df: pd.DataFrame, factor_name: str, quantiles
         else:
             mask = (ranks > lower_bound) & (ranks <= upper_bound)
 
-        # Select PnL of assets in this quantile
-        bucket_daily_pnl = asset_forward_pnl[mask].sum(axis=1).fillna(0.0)
+        # Sum the contributions of all assets in this bucket
+        bucket_daily_perf = performance_contribution[mask].sum(
+            axis=1).fillna(0.0)
 
-        # Cumulative PnL
-        cum_pnl = bucket_daily_pnl.cumsum()
+        # Cumulative Performance
+        cum_perf = bucket_daily_perf.cumsum()
 
         label = f"Q{q+1} ({int(lower_bound*100)}%-{int(upper_bound*100)}%)"
-        plt.plot(cum_pnl.index, cum_pnl, label=label,
+        plt.plot(cum_perf.index, cum_perf, label=label,
                  color=colors[q], linewidth=2)
 
-        total_pnl = bucket_daily_pnl.sum()
-        mean_pnl = bucket_daily_pnl.mean()
-        std_pnl = bucket_daily_pnl.std()
-        sharpe = (mean_pnl / std_pnl * (365**0.5)) if std_pnl != 0 else 0.0
+        total_perf = bucket_daily_perf.sum()
+        mean_perf = bucket_daily_perf.mean()
+        std_perf = bucket_daily_perf.std()
+        sharpe = (mean_perf / std_perf * (365**0.5)) if std_perf != 0 else 0.0
 
         stats_list.append({
             "Quantile": f"Q{q+1}",
-            "Total PnL": f"${total_pnl:,.0f}",
-            "Daily Mean": f"${mean_pnl:.2f}",
-            "PnL Sharpe": f"{sharpe:.2f}"
+            "Total": f"{total_perf:,.2f}",
+            "Daily Mean": f"{mean_perf:.4f}",
+            "Sharpe": f"{sharpe:.2f}"
         })
 
-    plt.title(f"Cumulative PnL by {factor_name} Quantile (Traded Assets Only)")
+    plt.title(f"Performance Contribution by {factor_name} Quantile")
     plt.xlabel("Date")
-    plt.ylabel("Cumulative PnL (USDT)")
+    plt.ylabel(y_label)
     plt.legend()
     plt.grid(True, alpha=0.3)
 
     save_path = os.path.join(
-        report_dir, f"quantile_pnl_traded_only_{factor_name}.png")
+        report_dir, f"quantile_perf_traded_{factor_name}.png")
     plt.savefig(save_path)
     plt.close()
     print(f"Chart saved to: {save_path}")
@@ -512,3 +526,125 @@ def generate_predictive_regime_analysis(equity_curve: pd.DataFrame):
         stats['Sharpe'] = stats['Sharpe'].map('{:.2f}'.format)
 
         print(stats)
+
+
+def analyze_pure_factor_quantiles(
+    score_df: pd.DataFrame,
+    factor_name: str,
+    quantiles: int = 5,
+    report_dir: str = ".",
+):
+    """
+    TRUE cross-sectional factor analysis — no selection bias, no abs(), beta-neutral.
+
+    Key design choices vs analyze_factor_quantiles:
+      - Uses ALL universe assets, not just traded ones (no is_traded filter).
+      - Does NOT take abs() of the factor — sign matters for direction.
+      - Uses cross-sectionally DEMEANED forward returns (subtract each day's
+        universe mean return). This removes market beta so Q5 vs Q1 spread
+        reflects the factor's alpha, not a bull-market tailwind.
+      - Equal-weight mean per bucket (not sum of weighted contributions).
+      - Long-short spread (Q_top minus Q_bottom) as a separate panel.
+
+    The demeaning is critical: without it, a signed factor in a bull market
+    trivially shows Q5 > Q1 simply because Q5 = most bullish assets. After
+    demeaning, outperformance is purely relative to the universe average.
+    """
+    required = [factor_name, 'close_price', 'symbol', 'ts']
+    if score_df.empty or not all(c in score_df.columns for c in required):
+        print(f"\n[Pure Factor] Skipping {factor_name}: missing required columns.")
+        return
+
+    print(f"\n--- Pure Cross-Sectional Factor Analysis: {factor_name} ---")
+    print("   (All universe assets, equal-weight, CS-demeaned returns, no selection bias)")
+
+    def _pivot(col):
+        try:
+            return score_df.pivot(index='ts', columns='symbol', values=col)
+        except ValueError:
+            return score_df.pivot_table(
+                index='ts', columns='symbol', values=col, aggfunc='mean')
+
+    factor_wide = _pivot(factor_name)   # signed — no abs()
+    price_wide  = _pivot('close_price')
+
+    # Forward 1-period return: row t = return earned by holding from t to t+1
+    fwd_returns = price_wide.pct_change().shift(-1)
+
+    # Cross-sectional demean: subtract the universe mean return each day.
+    # This removes the common market move (beta) so each bucket's performance
+    # is measured purely relative to the average asset, not absolute direction.
+    cs_mean     = fwd_returns.mean(axis=1)
+    fwd_demeaned = fwd_returns.sub(cs_mean, axis=0)
+
+    # Cross-sectional percentile rank of the factor (NaNs excluded automatically)
+    cs_ranks = factor_wide.rank(axis=1, pct=True)
+
+    stats_list = []
+    fig, axes = plt.subplots(2, 1, figsize=(13, 10), gridspec_kw={'height_ratios': [3, 1]})
+    ax_cum, ax_ls = axes
+    colors = plt.cm.RdYlGn(np.linspace(0, 1, quantiles))
+
+    bucket_rets = {}
+    for q in range(quantiles):
+        lo = q / quantiles
+        hi = (q + 1) / quantiles
+        if q == 0:
+            mask = (cs_ranks >= lo) & (cs_ranks <= hi)
+        else:
+            mask = (cs_ranks > lo) & (cs_ranks <= hi)
+
+        # Equal-weight mean of demeaned returns — not sum
+        daily_ret  = fwd_demeaned[mask].mean(axis=1).fillna(0.0)
+        bucket_rets[q] = daily_ret
+
+        cum_ret    = daily_ret.cumsum()   # additive since demeaned returns are already ~zero-sum
+        ann_ret    = daily_ret.mean() * 365
+        ann_vol    = daily_ret.std() * (365 ** 0.5)
+        sharpe     = ann_ret / ann_vol if ann_vol > 0 else 0.0
+        avg_assets = mask.sum(axis=1).mean()
+
+        label = f"Q{q+1} ({int(lo*100)}-{int(hi*100)}%)"
+        ax_cum.plot(cum_ret.index, cum_ret, label=label, color=colors[q], linewidth=2)
+
+        stats_list.append({
+            "Quantile":   f"Q{q+1} ({int(lo*100)}-{int(hi*100)}%)",
+            "Ann Alpha":  f"{ann_ret:.2%}",
+            "Ann Vol":    f"{ann_vol:.2%}",
+            "Sharpe":     f"{sharpe:.2f}",
+            "Avg N":      f"{avg_assets:.1f}",
+        })
+
+    # Long-short spread: long top bucket, short bottom bucket
+    ls_daily  = bucket_rets[quantiles - 1] - bucket_rets[0]
+    ls_cum    = ls_daily.cumsum()
+    ls_ann    = ls_daily.mean() * 365
+    ls_vol    = ls_daily.std() * (365 ** 0.5)
+    ls_sharpe = ls_ann / ls_vol if ls_vol > 0 else 0.0
+
+    ax_ls.plot(ls_cum.index, ls_cum, color='navy', linewidth=2,
+               label=f"L/S  Ann={ls_ann:.2%}  Sharpe={ls_sharpe:.2f}")
+    ax_ls.axhline(0, color='gray', linewidth=0.8, linestyle='--')
+
+    ax_cum.set_title(
+        f"Pure Factor Alpha: {factor_name}  "
+        f"(CS-demeaned returns, equal-weight, full universe)")
+    ax_cum.set_ylabel("Cumulative Alpha vs Universe Mean")
+    ax_cum.legend(fontsize=9)
+    ax_cum.grid(True, alpha=0.3)
+
+    ax_ls.set_title(f"Long-Short Spread  (Q{quantiles} long − Q1 short)")
+    ax_ls.set_ylabel("Cumulative Return Difference")
+    ax_ls.legend(fontsize=9)
+    ax_ls.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    save_path = os.path.join(report_dir, f"pure_factor_{factor_name}.png")
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    print(f"   Chart → {save_path}")
+
+    stats_df = pd.DataFrame(stats_list)
+    print(stats_df.to_string(index=False))
+    print(f"   L/S  Ann={ls_ann:.2%}  Sharpe={ls_sharpe:.2f}")
+    print("-" * 60)

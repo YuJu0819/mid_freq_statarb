@@ -3,8 +3,9 @@ import pandas as pd
 import time
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
+import requests  # <--- CRITICAL FIX: Added missing import
 from dotenv import load_dotenv
-
+from typing import Optional, List, Dict
 load_dotenv()
 
 api_key = os.getenv("BINANCE_API_KEY")
@@ -14,6 +15,7 @@ use_testnet = os.getenv("BINANCE_USE_TESTNET", "false").lower() == "true"
 client = Client(api_key, api_secret, testnet=use_testnet)
 
 # --- V-- NEW: RATE LIMIT WRAPPER --V ---
+BASE_URL = "https://fapi.binance.com"  # <--- Added missing parameter
 
 
 def safe_api_call(func, *args, **kwargs):
@@ -95,32 +97,49 @@ def fetch_futures_klines(symbol: str, interval: str, start_date: str, end_date: 
 
 
 def fetch_open_interest(symbol: str, interval: str = "1d", start_date: str = None, end_date: str = None, limit: int = 500) -> pd.DataFrame:
-    # (Same as before, simplified for brevity - assumes start_date logic we added)
     try:
         start_ts = int(pd.to_datetime(start_date).timestamp()
                        * 1000) if start_date else None
         end_ts = int(pd.to_datetime(end_date).timestamp()
-                     * 1000) if end_date else None
+                     * 1000) if end_date else int(time.time() * 1000)
 
-        oi_data = safe_api_call(
-            client.futures_open_interest_hist,
-            symbol=symbol,
-            period=interval,
-            limit=limit,
-            startTime=start_ts,
-            endTime=end_ts
-        )
+        all_oi = []
+        current_start = start_ts
 
-        if not oi_data:
+        while True:
+            oi_data = safe_api_call(
+                client.futures_open_interest_hist,
+                symbol=symbol,
+                period=interval,
+                limit=limit,
+                startTime=current_start,
+                endTime=end_ts,
+            )
+
+            if not oi_data:
+                break
+
+            all_oi.extend(oi_data)
+
+            last_ts = oi_data[-1]["timestamp"]
+            current_start = last_ts + 1
+
+            if len(oi_data) < limit or current_start > end_ts:
+                break
+
+            time.sleep(0.1)
+
+        if not all_oi:
             return pd.DataFrame()
 
-        df = pd.DataFrame(oi_data)
+        df = pd.DataFrame(all_oi)
         df["sumOpenInterestValue"] = pd.to_numeric(
             df["sumOpenInterestValue"], errors="coerce")
         df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
 
         df.rename(columns={"sumOpenInterestValue": "open_interest",
                   "timestamp": "ts"}, inplace=True)
+        df = df.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
         return df[["ts", "open_interest"]]
 
     except BinanceAPIException as e:
@@ -181,3 +200,113 @@ def fetch_funding_rate(symbol: str, start_date: str = None, end_date: str = None
     except BinanceAPIException as e:
         print(f"Error fetching funding rate for {symbol}: {e}")
         return pd.DataFrame()
+
+
+def fetch_top_long_short_ratio(
+    symbol: str,
+    interval: str,
+    start_str: Optional[str] = None,
+    end_str: Optional[str] = None,
+    limit: int = 500,
+) -> pd.DataFrame:
+
+    # URL for "Top Trader Account Ratio".
+    # Switch to /globalLongShortAccountRatio if you want the Global ratio.
+    url = "https://fapi.binance.com/futures/data/topLongShortAccountRatio"
+
+    # 1. Map interval to milliseconds for dynamic chunking
+    # This prevents the "Limit vs Chunk" bug
+    interval_map = {
+        "5m": 5 * 60 * 1000,
+        "15m": 15 * 60 * 1000,
+        "30m": 30 * 60 * 1000,
+        "1h": 60 * 60 * 1000,
+        "2h": 2 * 60 * 60 * 1000,
+        "4h": 4 * 60 * 60 * 1000,
+        "1d": 24 * 60 * 60 * 1000,
+    }
+
+    if interval not in interval_map:
+        raise ValueError(f"Unsupported interval: {interval}")
+
+    interval_ms = interval_map[interval]
+
+    # 2. Parse Timestamps
+    # If start_str is None, default to 30 days ago (API max retention)
+    now_ms = int(time.time() * 1000)
+
+    if start_str:
+        start_ts = int(pd.to_datetime(start_str, utc=True).timestamp() * 1000)
+    else:
+        start_ts = now_ms - (30 * 24 * 60 * 60 * 1000)
+
+    if end_str:
+        end_ts = int(pd.to_datetime(end_str, utc=True).timestamp() * 1000)
+    else:
+        end_ts = now_ms
+
+    # 3. Dynamic Chunk Calculation
+    # We request (limit * interval) duration to maximize throughput without hitting the limit
+    # We subtract 1 interval to be safe against boundary overlaps
+    chunk_duration_ms = (limit * interval_ms)
+
+    all_data = []
+    current_start = start_ts
+
+    print(f"Fetching {symbol} [{interval}] from {start_ts} to {end_ts}")
+
+    while current_start < end_ts:
+        # Calculate end of this chunk
+        current_end = min(current_start + chunk_duration_ms, end_ts)
+
+        params = {
+            "symbol": symbol,
+            "period": interval,
+            "limit": limit,
+            "startTime": current_start,
+            "endTime": current_end,
+        }
+
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+
+            # Handle the 400 error gracefully
+            if resp.status_code == 400:
+                print(
+                    f"Skipping chunk {current_start}-{current_end}: Data likely too old (Max 30 days).")
+                current_start = current_end
+                continue
+
+            resp.raise_for_status()
+            data = resp.json()
+
+            if isinstance(data, list) and data:
+                all_data.extend(data)
+
+                # OPTIMIZATION: Update current_start based on the *actual* last data point received
+                # This handles gaps in data (e.g., maintenance) gracefully
+                last_data_ts = data[-1]['timestamp']
+                current_start = last_data_ts + interval_ms
+            else:
+                # If no data returned (empty list), move pointer forward
+                current_start = current_end
+
+        except Exception as e:
+            print(f"Error fetching {symbol}: {e}")
+            break
+
+        time.sleep(0.1)
+
+    df = pd.DataFrame(all_data)
+    if df.empty:
+        return pd.DataFrame()
+
+    df["timestamp"] = df["timestamp"].astype("int64")
+    df["ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df["ls_ratio"] = df["longShortRatio"].astype(float)
+
+    # Dedup and Sort
+    df = df.drop_duplicates(subset=["timestamp"]).sort_values(
+        "timestamp").reset_index(drop=True)
+
+    return df[["ts", "ls_ratio"]]

@@ -134,6 +134,41 @@ def calc_funding_zscore(funding_rates, lookback: int):
     return (funding_rates - mean) / std
 
 
+def calc_cs_zscore(target):
+    target = target.replace(0, np.nan)
+    mean = np.mean(target, axis=0)
+    std = np.std(target, axis=0)
+    return (target - mean) / std
+
+
+def calc_beta_df(closes_wide, lookback):
+    returns_wide = closes_wide.pct_change()  # Do not fillna(0) yet
+
+    # Create Proxy (BTC/ETH/SOL)
+    # Filter columns that exist in your closes_wide
+    proxy_assets = [c for c in ['BTCUSDT', 'ETHUSDT',
+                                'SOLUSDT'] if c in closes_wide.columns]
+
+    if not proxy_assets:
+        market_returns = returns_wide.mean(axis=1)  # Fallback
+    else:
+        market_returns = returns_wide[proxy_assets].mean(axis=1)
+
+    # Calculate Rolling Beta
+    market_var = market_returns.rolling(window=lookback).var()
+    rolling_cov = returns_wide.rolling(window=lookback).cov(market_returns)
+
+    beta_df = rolling_cov.div(market_var, axis=0)
+    # Calculate the mean across the cross-section for each timestamp
+    cs_mean_beta = beta_df.mean(axis=1)
+
+    # Fill NaNs in each row with the mean of that row
+    beta_df = beta_df.apply(lambda row: row.fillna(
+        cs_mean_beta[row.name]), axis=1)
+    # Fill missing betas with 1.0 (Assume correlation if unknown)
+    return beta_df.clip(-3, 3)
+
+
 def calc_volatility(prices, lookback: int):
     return prices.pct_change().rolling(lookback).std()
 

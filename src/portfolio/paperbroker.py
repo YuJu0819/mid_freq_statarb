@@ -1,5 +1,5 @@
 import pandas as pd
-from ..core.types import Order, Fill
+from ..core.types import Order, Fill, BacktestResult
 
 
 class PaperBroker:
@@ -96,7 +96,6 @@ class PaperBroker:
         return {"equity": equity, "cash": self.cash, "market_value": market_value}
 
     def get_results(self):
-        from ..backtest.engine import BacktestResult
         return BacktestResult(
             equity_curve=pd.DataFrame(),
             trades=pd.DataFrame(self.trades),

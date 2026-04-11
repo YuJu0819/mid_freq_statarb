@@ -1,5 +1,6 @@
-data/parquet
-data/open_interest
+data/
+data/
 reports/
+data_v1/
 __pycache__/
 .env.example

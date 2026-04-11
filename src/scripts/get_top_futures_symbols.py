@@ -59,10 +59,12 @@ def get_top_futures_symbols(top_n: int = 100) -> list[str]:
 
 
 def main():
-    top_100_symbols = get_top_futures_symbols(100)
+    K = 150
+    top_100_symbols = get_top_futures_symbols(K)
 
     if top_100_symbols:
-        print("\n--- Top 100 Futures Symbols by 24h Trading Volume (USDT) ---")
+        print(
+            f"\n--- Top {K} Futures Symbols by 24h Trading Volume (USDT) ---")
         # Print in a format that's easy to copy into config.yaml
         print("symbols: [", end="")
         for i, symbol in enumerate(top_100_symbols):

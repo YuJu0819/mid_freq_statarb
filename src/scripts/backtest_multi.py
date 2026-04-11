@@ -8,17 +8,13 @@ from ..core.utils import load_config
 from ..data.binance_rest import fetch_klines as fetch_spot_klines
 from ..data.binance_futures_rest import fetch_futures_klines
 from ..data.storage import parquet_path, save_bars, load_bars
-from ..backtest.engine import run_multi_asset
-from ..backtest.reporting import (
-    plot_equity_curve, generate_regime_analysis_report,
-    generate_weekday_analysis_report, generate_skew_analysis_report,
-    generate_daily_regime_analysis,  # <-- IMPORTED
-    plot_cross_sectional_analysis, plot_daily_regime_pnl_ts, analyze_factor_quantiles,
-    generate_predictive_regime_analysis
-)
+from ..backtest.engine import run_multi_asset, run_vectorized_backtest
+from ..backtest.reporting import *
 from ..data.binance_futures_rest import fetch_funding_rate
 from ..strategy.ad_mom_spot_future import FinalStrategy
 from .. import factors
+from ..strategy.distributed import DistributedStrategy
+from ..data.universe import load_validated_universe
 
 
 def load_local_oi_data(symbol, start_date, end_date, data_dir="./data/open_interest"):
@@ -95,9 +91,20 @@ def main():
         "--start_date", help="Start date in YYYY-MM-DD format", required=True)
     ap.add_argument(
         "--end_date", help="End date in YYYY-MM-DD format", required=True)
+    ap.add_argument(
+        "--run_id", help="ID for this backtest run", default="default_run")
     args = ap.parse_args()
     cfg = load_config()
-    symbols = cfg["backtest"]["symbols"]
+    validated = load_validated_universe(args.start_date, args.end_date)
+    if validated is not None:
+        symbols = validated
+        print(f"Loaded validated universe: {len(symbols)} symbols  "
+              f"(run prepare_universe to refresh)")
+    else:
+        symbols = cfg["backtest"]["symbols"]
+        print(f"WARNING: No validated universe found for {args.start_date}→{args.end_date}. "
+              f"Run 'python -m src.scripts.prepare_universe' first. "
+              f"Falling back to all {len(symbols)} config symbols.")
     interval = "1d"
 
     # --- Step 1: Prepare Market Regime Data (Basket Proxy) ---
@@ -228,9 +235,13 @@ def main():
     strat = FinalStrategy(lookback=30, quantile=0.4, min_volume_usd=10_000_000,
                           funding_lookback=180, funding_z_threshold=1.5, trend_ma_length=30,
                           smooth_lookback=10, vol_lookback=30, vol_adj_factor=0.5,
-                          inverse_in_weak_regime=True)
+                          inverse_in_weak_regime=True,
+                          conviction_top_fraction=0.33)  # keep top 1/3 by |trend_score| → matches Q3
+    # strat = DistributedStrategy(lookback=30)
 
-    res = run_multi_asset(all_data, strat, cfg)
+    # res = run_multi_asset(all_data, strat, cfg)
+    res = run_vectorized_backtest(
+        all_data, strat, cfg, run_id=args.run_id, file_name='momentum')
 
     print("\n==== Summary ====")
     for k, v in res.summary.items():
@@ -270,25 +281,36 @@ def main():
 
         generate_skew_analysis_report(res.trades)
 
-        # --- V-- NEW: GENERALIZED FACTOR ANALYSIS TOOL --V ---
-        print("\n==== Cross-Sectional Factor Analysis ====")
-        # Pass the score_history, the raw data dictionary, and the column name to analyze
-        # You can add any column found in your score_components here!
+    # --- V-- NEW: GENERALIZED FACTOR ANALYSIS TOOL --V ---
+    print("\n==== Cross-Sectional Factor Analysis ====")
+    # Pass the score_history, the raw data dictionary, and the column name to analyze
+    # You can add any column found in your score_components here!
 
-        factors_to_analyze = [
-            'trend_score',      # Does high trend score actually predict returns?
-            'volatility',       # Do high vol assets underperform?
-            'funding_z_score',  # Is mean reversion real for funding?
-            'basis_momentum',    # Does basis mom work?
-            'sentiment_score'
-        ]
-        for factor in factors_to_analyze:
-            analyze_factor_quantiles(
-                score_df=res.score_history,
-                factor_name=factor,
-                quantiles=3,
-                report_dir=report_dir
-            )
+    factors_to_analyze = [
+        'trend_score',      # Does high trend score actually predict returns?
+        'volatility',       # Do high vol assets underperform?
+        'funding_z_score',  # Is mean reversion real for funding?
+        'basis_momentum',    # Does basis mom work?
+        'sentiment_score'
+    ]
+    for factor in factors_to_analyze:
+        analyze_factor_quantiles(
+            score_df=res.score_history,
+            factor_name=factor,
+            quantiles=3,
+            report_dir=report_dir
+        )
+
+    # Pure factor analysis — no selection bias, equal-weight, signed
+    # print("\n==== Pure Factor Analysis (unbiased) ====")
+    # from ..backtest.reporting import analyze_pure_factor_quantiles
+    # for factor in ['trend_score', 'sentiment_score', 'funding_z_score']:
+    #     analyze_pure_factor_quantiles(
+    #         score_df=res.score_history,
+    #         factor_name=factor,
+    #         quantiles=5,
+    #         report_dir=report_dir,
+    #     )
 
 
 if __name__ == "__main__":

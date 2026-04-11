@@ -1,16 +1,9 @@
 import pandas as pd
-from dataclasses import dataclass
-from ..core.types import Order
+from ..core.types import Order, BacktestResult
 from ..portfolio.paperbroker import PaperBroker
-import numpy as np  # Added for NaN handling
-
-
-@dataclass
-class BacktestResult:
-    equity_curve: pd.DataFrame
-    trades: pd.DataFrame
-    summary: dict
-    score_history: pd.DataFrame
+import numpy as np
+from ..core.utils import ensure_dir
+import os
 
 
 def run_multi_asset(data: dict[str, pd.DataFrame], strategy, cfg: dict) -> BacktestResult:
@@ -172,3 +165,74 @@ def run_multi_asset(data: dict[str, pd.DataFrame], strategy, cfg: dict) -> Backt
     }
 
     return BacktestResult(equity_curve=eq, trades=tr, summary=summary, score_history=score_df)
+
+
+def run_vectorized_backtest(data: dict[str, pd.DataFrame], strategy, cfg: dict, run_id='default', file_name='default') -> BacktestResult:
+    """
+    Calculates PnL using (Signal * Return) - Costs.
+    Uses 'generate_all_signals' for true vectorization.
+    """
+    initial_cash = cfg["backtest"]["initial_cash"]
+    cost_bps = (cfg["backtest"]["fee_bps"] +
+                cfg["backtest"]["slippage_bps"]) / 10000
+
+    # 1. Align Prices (for Returns Calculation)
+    all_ts = pd.Index([])
+    for df in data.values():
+        if not df.empty:
+            all_ts = all_ts.union(df['ts'])
+    all_ts = all_ts.sort_values().unique()
+
+    # Wide Close Prices
+    closes_dict = {sym: df.set_index(
+        'ts')['futures_close'] for sym, df in data.items()}
+    prices_df = pd.DataFrame(closes_dict).reindex(all_ts).ffill()
+
+    # 2. Generate Signals (Vectorized)
+    print("Generating signals (Vectorized)...")
+    weights_df, score_history_df = strategy.generate_all_signals(data)
+
+    # NaN means no signal → flatten the position (treat as 0 weight).
+    # We deliberately do NOT ffill here: holding a stale weight on missing signal days
+    # would silently overleverage the portfolio.
+    weights_df = weights_df.reindex(all_ts).fillna(0.0)
+    output_dir = ensure_dir(f"./reports/strategies/{run_id}")
+    weights_path = os.path.join(output_dir, f"{file_name}.parquet")
+
+    weights_df.to_parquet(weights_path)
+    print(f"Weights saved to: {weights_path}")
+    # 3. Calculate Vectorized PnL
+    returns_df = prices_df.pct_change().fillna(0.0)
+
+    # Lag weights by 1: Weights calculated at T act on Returns at T+1
+    lagged_weights = weights_df.shift(1).fillna(0.0)
+
+    # Portfolio Return = Sum(Weight * Asset_Return)
+    port_rets_gross = (lagged_weights * returns_df).sum(axis=1)
+
+    # Turnover Cost = Sum(Abs(Delta_Weight)) * Cost_bps
+    turnover = weights_df.diff().abs().sum(axis=1).fillna(0.0)
+    costs = turnover * cost_bps
+
+    port_rets_net = port_rets_gross - costs
+
+    # 4. Construct Equity Curve
+    cumulative_ret = (1 + port_rets_net).cumprod()
+    equity_curve = initial_cash * cumulative_ret
+
+    eq_df = pd.DataFrame({'equity': equity_curve, 'ts': equity_curve.index})
+
+    # 5. Summary
+    summary = {
+        "final_equity": float(equity_curve.iloc[-1]) if not equity_curve.empty else initial_cash,
+        "return_pct": float((cumulative_ret.iloc[-1] - 1) * 100) if not cumulative_ret.empty else 0.0,
+        "sharpe_daily": float(port_rets_net.mean() / port_rets_net.std() * (365**0.5)) if port_rets_net.std() != 0 else 0.0,
+        "turnover_avg": float(turnover.mean())
+    }
+
+    return BacktestResult(
+        equity_curve=eq_df,
+        trades=pd.DataFrame(),  # Empty for vectorized
+        summary=summary,
+        score_history=score_history_df  # Populated for analysis
+    )

@@ -1,4 +1,6 @@
 from typing import Literal, TypedDict, Optional, Dict, Any
+from dataclasses import dataclass
+import pandas as pd
 
 Side = Literal["BUY", "SELL"]
 OrderType = Literal["MARKET", "LIMIT"]
@@ -36,3 +38,11 @@ class PortfolioSnapshot(TypedDict):
     cash: float
     positions: Dict[str, Position]
     ts: int
+
+
+@dataclass
+class BacktestResult:
+    equity_curve: pd.DataFrame
+    trades: pd.DataFrame
+    summary: dict
+    score_history: pd.DataFrame

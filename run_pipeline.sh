@@ -150,7 +150,7 @@ if should_run 6; then
         --start_date "$START_DATE" \
         --end_date   "$END_DATE" \
         --strategies momentum reversal \
-        --method     linear \
+        --method     mean_variance \
         --max_position 0.10
 fi
 
@@ -186,7 +186,7 @@ if should_run 9; then
         --min_train_periods 126 \
         --quantile      0.4 \
         --max_weight    0.10 \
-        --max_rounds    300 \
+        --max_rounds    200 \
         --interactions  15 \
         --features all \
         --weight_mode rank \
@@ -197,7 +197,8 @@ if should_run 9; then
         --block_size 63 \
         --embargo_pct 0.01 \
         --outer_bags 1 \
-        --target_beta_neutral
+        --target_beta_neutral \
+        --use_moe
 fi
 
 # --- Step 10: Backtest EBM signal --------------------------------------------

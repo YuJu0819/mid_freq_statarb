@@ -5,16 +5,28 @@ import numpy as np
 
 
 def plot_equity_curve(equity_curve: pd.DataFrame, save_path: str):
-    plt.figure(figsize=(10, 6))
-    plt.plot(equity_curve.index, equity_curve["equity"])
-    plt.title("Backtest Equity Curve")
+    plt.figure(figsize=(12, 6))
+
+    plt.plot(equity_curve.index, equity_curve["equity"],
+             label="Strategy (Lag 1)", linewidth=2, color="steelblue")
+
+    if "equity_lag5" in equity_curve.columns:
+        plt.plot(equity_curve.index, equity_curve["equity_lag5"],
+                 label="Lag 5", linewidth=1.2, color="darkorange", linestyle="--", alpha=0.85)
+
+    if "equity_lag10" in equity_curve.columns:
+        plt.plot(equity_curve.index, equity_curve["equity_lag10"],
+                 label="Lag 10", linewidth=1.2, color="firebrick", linestyle=":", alpha=0.85)
+
+    plt.title("Backtest Equity Curve — Signal Lag Comparison")
     plt.xlabel("Date")
     plt.ylabel("Portfolio Value (USDT)")
+    plt.legend()
     plt.grid(True)
 
     # Ensure the directory exists
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.savefig(save_path)
+    plt.savefig(save_path, bbox_inches="tight")
     plt.close()
     print(f"Equity curve saved to: {save_path}")
 

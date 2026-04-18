@@ -204,30 +204,36 @@ def run_vectorized_backtest(data: dict[str, pd.DataFrame], strategy, cfg: dict, 
     # 3. Calculate Vectorized PnL
     returns_df = prices_df.pct_change().fillna(0.0)
 
+    def _build_equity(lag: int) -> pd.Series:
+        w = weights_df.shift(lag).fillna(0.0)
+        gross = (w * returns_df).sum(axis=1)
+        to = weights_df.diff().abs().sum(axis=1).fillna(0.0)
+        net = gross - to * cost_bps
+        return initial_cash * (1 + net).cumprod()
+
     # Lag weights by 1: Weights calculated at T act on Returns at T+1
-    lagged_weights = weights_df.shift(1).fillna(0.0)
+    equity_lag1 = _build_equity(1)
+    equity_lag5 = _build_equity(5)
+    equity_lag10 = _build_equity(10)
 
-    # Portfolio Return = Sum(Weight * Asset_Return)
-    port_rets_gross = (lagged_weights * returns_df).sum(axis=1)
-
-    # Turnover Cost = Sum(Abs(Delta_Weight)) * Cost_bps
-    turnover = weights_df.diff().abs().sum(axis=1).fillna(0.0)
-    costs = turnover * cost_bps
-
-    port_rets_net = port_rets_gross - costs
+    port_rets_net = (equity_lag1 / equity_lag1.shift(1) - 1).fillna(0.0)
 
     # 4. Construct Equity Curve
-    cumulative_ret = (1 + port_rets_net).cumprod()
-    equity_curve = initial_cash * cumulative_ret
+    equity_curve = equity_lag1
 
-    eq_df = pd.DataFrame({'equity': equity_curve, 'ts': equity_curve.index})
+    eq_df = pd.DataFrame({
+        'equity': equity_lag1,
+        'equity_lag5': equity_lag5,
+        'equity_lag10': equity_lag10,
+        'ts': equity_lag1.index,
+    })
 
     # 5. Summary
     summary = {
         "final_equity": float(equity_curve.iloc[-1]) if not equity_curve.empty else initial_cash,
-        "return_pct": float((cumulative_ret.iloc[-1] - 1) * 100) if not cumulative_ret.empty else 0.0,
+        "return_pct": float((equity_lag1.iloc[-1] / equity_lag1.iloc[0] - 1) * 100) if not equity_lag1.empty else 0.0,
         "sharpe_daily": float(port_rets_net.mean() / port_rets_net.std() * (365**0.5)) if port_rets_net.std() != 0 else 0.0,
-        "turnover_avg": float(turnover.mean())
+        "turnover_avg": float(weights_df.diff().abs().sum(axis=1).fillna(0.0).mean())
     }
 
     return BacktestResult(

@@ -203,9 +203,26 @@ def main():
     print("1. Fetching Symbol List and Onboard Dates...")
     cfg = load_config("config.yaml")
 
-    # OPTION A: Strictly use the config symbols (Recommended for Backtesting)
-    symbols = cfg["backtest"]["symbols"]
-    print(f"1. Loaded {len(symbols)} symbols from config.yaml")
+    # Build the union of symbols across ALL rolling universe snapshots so that
+    # metrics are downloaded for every coin that has ever been in any epoch,
+    # not just the coins currently in config.yaml.
+    from ..data.rolling_universe import RollingUniverse
+    ru = RollingUniverse()
+    snapshot_symbols: set = set()
+    for snap_date in ru.list_snapshots():
+        snapshot_symbols.update(ru._load(snap_date))
+
+    config_symbols: list = cfg["backtest"]["symbols"]
+
+    if snapshot_symbols:
+        symbols = sorted(snapshot_symbols | set(config_symbols))
+        print(f"1. Loaded {len(symbols)} symbols "
+              f"(union of {len(ru.list_snapshots())} snapshots + config.yaml; "
+              f"config alone has {len(config_symbols)})")
+    else:
+        symbols = config_symbols
+        print(f"1. Loaded {len(symbols)} symbols from config.yaml "
+              f"(no rolling snapshots found — using config only)")
 
     # -----------------------------------------------------
     # NEW STEP: Determine specific start date for each symbol

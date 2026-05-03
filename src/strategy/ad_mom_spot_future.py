@@ -351,26 +351,35 @@ class FinalStrategy:
 
         return signals, score_components
 
-    def generate_all_signals(self, data: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def _compute_signals_for_symbols(
+        self,
+        all_data: Dict[str, pd.DataFrame],
+        active_symbols: List[str],
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        FULLY VECTORIZED Signal Generation.
-        Runs the exact logic of 'on_rebalance' but on the entire history at once.
-        Returns:
-            weights_df: DataFrame (Index=Time, Columns=Assets)
-            score_history_df: DataFrame (Long format for reporting)
-        """
-        # --- 1. Align Data to Wide DataFrames ---
-        # Get the union of all timestamps
-        all_ts = pd.Index([])
-        for df in data.values():
-            if not df.empty:
-                all_ts = all_ts.union(df['ts'])
-        all_ts = all_ts.sort_values().unique()
+        Core signal computation using ONLY `active_symbols` for CS operations.
 
-        # Helper to build wide frames
+        `all_data` still contains the full history of all symbols so the TS
+        rolling window can warm up correctly — pre-epoch price history is
+        used for lookback but CS normalization (vol rank, z-score, final rank)
+        only sees `active_symbols`.  This keeps the cross-sectional distribution
+        stable and prevents universe-size changes from contaminating scores.
+
+        Returns (weights_wide, score_history_df) indexed over the full date
+        range of the data.  The caller slices to the epoch's active dates.
+        """
+        # Build wide frames from active_symbols only
+        all_ts_set: set = set()
+        for sym in active_symbols:
+            df = all_data.get(sym)
+            if df is not None and not df.empty:
+                all_ts_set.update(df['ts'].tolist())
+        all_ts = pd.DatetimeIndex(sorted(all_ts_set))
+
         def make_wide(col, fill_val=np.nan):
-            d = {sym: df.set_index('ts')[col]
-                 for sym, df in data.items() if col in df.columns}
+            d = {sym: all_data[sym].set_index('ts')[col]
+                 for sym in active_symbols
+                 if sym in all_data and col in all_data[sym].columns}
             return pd.DataFrame(d).reindex(all_ts).ffill().fillna(fill_val)
 
         closes_wide = make_wide('futures_close')
@@ -379,8 +388,7 @@ class FinalStrategy:
         vol_ratio_wide = make_wide('volume_ratio', 0.0)
         funding_wide = make_wide('funding_rate', 0.0)
 
-        # --- 2. Vectorized Factor Calculations ---
-        # Exact same calls as on_rebalance
+        # Factor calculations
         price_roc = factors.calc_price_mom(
             closes_wide, self.lookback, self.smooth_lookback).fillna(0.0)
         oi_roc = factors.calc_oi_mom(
@@ -390,131 +398,165 @@ class FinalStrategy:
         vol_ratio_sig = factors.calc_vol_ratio_signal(
             vol_ratio_wide, self.lookback, self.lookback).fillna(1.0)
 
-        # Trend Score
         trend_score = price_roc * (1 + 2 * oi_roc)
-
-        # Sentiment Score
         valid_sentiment = ~(np.isinf(basis_mom) | np.isinf(vol_ratio_sig))
         sentiment_score = (basis_mom * vol_ratio_sig *
                            5).where(valid_sentiment, 0.0)
-
-        # Neutralization
-        # sentiment_score = self.neutralize_signal(sentiment_score, trend_score)
-
         combined_score = trend_score + sentiment_score
 
-        # Volatility & Funding
         volatility = factors.calc_volatility(
             closes_wide, self.vol_lookback).fillna(0.0)
         funding_z = factors.calc_funding_zscore(
             funding_wide, self.funding_lookback).fillna(0.0)
 
-        # FIX: Capture the return value
-        sent_z = factors.calc_cs_zscore(sentiment_score).fillna(0.0)
-        trend_z = factors.calc_cs_zscore(trend_score).fillna(0.0)
-        # --- 3. Vectorized Adjustments ---
-
-        # Volatility Adjustment
+        # CS operations — only active_symbols are present, so distribution is clean
         active_volatility = volatility.replace(0.0, np.nan)
         vol_ranks = active_volatility.rank(axis=1, pct=True).fillna(0.5)
         vol_adjustment = (1 - vol_ranks * self.vol_adj_factor).clip(lower=0.0)
 
-        # Final Score
+        trend_z = factors.calc_cs_zscore(trend_score).fillna(0.0)
+
         final_score = combined_score * vol_adjustment
 
-        # Beta-neutralize the SCORE before ranking.
+        # Beta-neutralize
         beta_df = factors.calc_beta_df(closes_wide, 60)
         final_score = self.neutralize_signal(final_score, beta_df)
 
-        # --- 4. Vectorized Selection & Weighting ---
-        # Rank: 1 = lowest score, n_assets = highest score (integer ranks)
-        n_assets = final_score.shape[1]
+        # Rank-based selection & weighting
         int_ranks = final_score.rank(axis=1, method='first')
-        pct_ranks = int_ranks / n_assets  # percentile equivalent for mask thresholds
+        n_active = final_score.notna().sum(axis=1).replace(0, 1)
+        pct_ranks = int_ranks.div(n_active, axis=0)
 
-        # trend_z percentile rank (cross-sectional, same timestamp axis)
-        trend_z_pct = trend_z.rank(axis=1, pct=True)
+        long_mask = pct_ranks > (1 - self.quantile)
+        short_mask = pct_ranks <= self.quantile
 
-        # Masks for Top/Bottom Quantiles — intersection with trend_z eligibility.
-        # Longs: top final_score quantile AND top trend_z quantile (momentum confirms).
-        # Shorts: bottom final_score quantile AND bottom trend_z quantile.
-        long_mask = (pct_ranks > (1 - self.quantile))
-        short_mask = (pct_ranks <= self.quantile)
-
-        # Conviction filter: mirrors the Q3 bucket in analyze_factor_quantiles.
-        # Ranks abs(trend_score) across ALL selected assets (longs + shorts jointly),
-        # then keeps only the top conviction_top_fraction — identical to how the
-        # reporting function groups traded assets by |trend_score| before bucketing.
         if self.conviction_top_fraction is not None:
             selected_mask = long_mask | short_mask
-            abs_trend_selected = trend_score.abs().where(selected_mask)  # NaN for non-selected
-            # rank() naturally excludes NaNs, so only selected assets are ranked
+            abs_trend_selected = trend_score.abs().where(selected_mask)
             abs_trend_pct = abs_trend_selected.rank(axis=1, pct=True)
-            conviction_mask = abs_trend_pct > (1.0 - self.conviction_top_fraction)
-            long_mask  = long_mask  & conviction_mask
+            conviction_mask = abs_trend_pct > (
+                1.0 - self.conviction_top_fraction)
+            long_mask = long_mask & conviction_mask
             short_mask = short_mask & conviction_mask
 
-        # Initialize Weights Matrix
-        weights = pd.DataFrame(0.0, index=final_score.index,
-                               columns=final_score.columns)
-
-        # Rank-proportional weights — matches on_rebalance assign_normalized_weights.
-        # Every selected asset gets a non-zero weight regardless of score magnitude.
-
-        # Longs: higher int_rank (better score) → higher weight
         long_rank_scores = int_ranks.where(long_mask, 0.0)
         long_rank_sum = long_rank_scores.sum(axis=1).replace(0, 1.0)
         weights_long = long_rank_scores.div(long_rank_sum, axis=0) * 0.5
 
-        # Shorts: lower int_rank (worse score) → higher absolute short weight
-        short_rank_scores = (n_assets + 1 - int_ranks).where(short_mask, 0.0)
+        short_rank_scores = int_ranks.rsub(
+            n_active + 1, axis=0).where(short_mask, 0.0)
         short_rank_sum = short_rank_scores.sum(axis=1).replace(0, 1.0)
         weights_short = -(short_rank_scores.div(short_rank_sum, axis=0)) * 0.5
 
-        weights = weights_long.fillna(0.0) + weights_short.fillna(0.0)
+        weights = (weights_long.fillna(0.0) + weights_short.fillna(0.0)).clip(
+            -MAX_WEIGHT_PER_ASSET, MAX_WEIGHT_PER_ASSET)
 
-        # Cap Weights
-        weights = weights.clip(-MAX_WEIGHT_PER_ASSET, MAX_WEIGHT_PER_ASSET)
+        # Mask Q1 of trend score among traded assets — keep only Q2 and Q3.
+        # Uses abs(trend_score) ranked within the traded set, which exactly
+        # matches the reporting's analyze_factor_quantiles bucketing logic
+        # (reporting does: factor_wide.abs() → rank within is_traded).
+        # Q1 = weakest signal magnitude → zero out; Q2+Q3 = kept.
+        is_traded = weights != 0
+        abs_trend_traded = trend_score.abs().where(is_traded)   # NaN for non-traded
+        abs_trend_pct = abs_trend_traded.rank(axis=1, pct=True)
+        q1_mask = is_traded & (abs_trend_pct <= (1.0 / 2))
+        weights = weights.where(~q1_mask, 0.0)
 
-        # --- 5. Prepare Reporting Data (Long Format) ---
-        # Used for analyze_factor_quantiles
+        # Build long-format score history
+        def _stack(wide: pd.DataFrame, name: str) -> pd.Series:
+            s = wide.stack()
+            s.index.names = ['ts', 'symbol']
+            s.name = name
+            return s
 
-        components = {
-            'final_score': final_score,
-            'trend_score': trend_score,
-            'sentiment_score': sentiment_score,
-            'funding_z_score': funding_z,
-            'volatility': volatility,
-            'price_roc': price_roc
-        }
-
-        # Stack DataFrames for report
-        base_df = final_score.stack().reset_index()
-        base_df.columns = ['ts', 'symbol', 'final_score']
-
-        for name, df in components.items():
-            if name == 'final_score':
-                continue
-            stacked = df.stack().reset_index()
-            stacked.columns = ['ts', 'symbol', name]
-            base_df = base_df.set_index(['ts', 'symbol'])
-            stacked = stacked.set_index(['ts', 'symbol'])
-            base_df[name] = stacked[name]
-            base_df = base_df.reset_index()
-
-        # Add positions and close prices
-        stacked_w = weights.stack().reset_index()
-        stacked_w.columns = ['ts', 'symbol', 'position_qty']  # Proxy
-
-        stacked_p = closes_wide.stack().reset_index()
-        stacked_p.columns = ['ts', 'symbol', 'close_price']
-
-        base_df = base_df.set_index(['ts', 'symbol'])
-        base_df['position_qty'] = stacked_w.set_index(['ts', 'symbol'])[
-            'position_qty']
-        base_df['close_price'] = stacked_p.set_index(['ts', 'symbol'])[
-            'close_price']
-
-        score_history_df = base_df.reset_index()
+        score_history_df = pd.concat([
+            _stack(final_score,     'final_score'),
+            _stack(trend_score,     'trend_score'),
+            _stack(sentiment_score, 'sentiment_score'),
+            _stack(funding_z,       'funding_z_score'),
+            _stack(volatility,      'volatility'),
+            _stack(price_roc,       'price_roc'),
+            _stack(weights,         'position_qty'),
+            _stack(closes_wide,     'close_price'),
+        ], axis=1).reset_index()
 
         return weights, score_history_df
+
+    def generate_all_signals(self, data: Dict[str, pd.DataFrame], epoch_mask_df=None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        When epoch_mask_df is None: single-pass computation over all symbols.
+
+        When epoch_mask_df is provided: per-epoch computation (same pattern as
+        LiquidationReversalStrategy).  For each distinct epoch, signals are
+        computed using only that epoch's active symbols so the CS distribution
+        stays consistent within each epoch.  Full price history is used for TS
+        rolling warmup.  Only the epoch's active date rows are kept, then
+        results are concatenated and re-indexed to the full date range.
+
+        Returns:
+            weights_df: DataFrame (Index=Time, Columns=Assets)
+            score_history_df: DataFrame (Long format for reporting)
+        """
+        if epoch_mask_df is None or epoch_mask_df.empty:
+            active_symbols = [sym for sym, df in data.items() if not df.empty]
+            return self._compute_signals_for_symbols(data, active_symbols)
+
+        # --- Detect epoch boundaries ---
+        active_col_sets = epoch_mask_df.fillna(False).apply(
+            lambda row: frozenset(row.index[row]), axis=1
+        )
+        epochs: list = []
+        prev_set = None
+        for ts, sym_set in active_col_sets.items():
+            if sym_set != prev_set:
+                epochs.append((ts, sym_set))
+                prev_set = sym_set
+
+        all_dates = epoch_mask_df.index
+        epoch_date_ranges = []
+        for i, (ep_start, sym_set) in enumerate(epochs):
+            ep_end = epochs[i + 1][0] - \
+                pd.Timedelta(days=1) if i + 1 < len(epochs) else all_dates[-1]
+            epoch_date_ranges.append((ep_start, ep_end, list(sym_set)))
+
+        # --- Per-epoch signal computation ---
+        weight_slices = []
+        score_slices = []
+
+        for ep_start, ep_end, active_symbols in epoch_date_ranges:
+            if not active_symbols:
+                continue
+
+            print(f"  [Momentum] Epoch {ep_start.date()} → {ep_end.date()} "
+                  f"({len(active_symbols)} symbols)")
+
+            weights_ep, scores_ep = self._compute_signals_for_symbols(
+                data, active_symbols)
+
+            weights_slice = weights_ep.loc[
+                (weights_ep.index >= ep_start) & (weights_ep.index <= ep_end)
+            ]
+            scores_slice = scores_ep[
+                (scores_ep['ts'] >= ep_start) & (scores_ep['ts'] <= ep_end)
+            ]
+
+            weight_slices.append(weights_slice)
+            score_slices.append(scores_slice)
+
+        if not weight_slices:
+            empty_w = pd.DataFrame(0.0, index=epoch_mask_df.index,
+                                   columns=epoch_mask_df.columns)
+            return empty_w, pd.DataFrame()
+
+        # Concatenate and reindex to full date range
+        final_weights = (
+            pd.concat(weight_slices)
+            .reindex(all_dates)
+            .fillna(0.0)
+        )
+        final_weights = final_weights.reindex(
+            columns=epoch_mask_df.columns, fill_value=0.0)
+
+        final_scores = pd.concat(score_slices, ignore_index=True)
+
+        return final_weights, final_scores

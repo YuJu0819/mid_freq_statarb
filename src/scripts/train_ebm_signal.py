@@ -60,8 +60,10 @@ Usage
       --moe_boost_lambda 0.5 --expert_interactions 5 --moe_hysteresis 3
 """
 from ..core.utils import ensure_dir
+from ..data.rolling_universe import RollingUniverse, build_symbol_active_mask
 from ..alpha.ml_utils import (
     normalize_features,
+    neutralize_features_on_adx,
     build_target,
     predictions_to_weights,
     neutralize_scores,
@@ -364,22 +366,31 @@ class ResidualMoE:
     def predict_global(self, X: np.ndarray) -> np.ndarray:
         return np.mean([m.predict(X) for m in self.global_models], axis=0)
 
-    def predict_expert(self, regime: str | None, X: np.ndarray) -> np.ndarray:
+    def predict_expert(
+        self,
+        regime: str | None,
+        X: np.ndarray,
+        X_expert: "np.ndarray | None" = None,
+    ) -> np.ndarray:
         if regime is None or regime not in self.expert_dict:
             return np.zeros(len(X))
         experts = self.expert_dict[regime]
         if not experts:
             return np.zeros(len(X))
-        return np.mean([m.predict(X) for m in experts], axis=0)
+        # If ADX-neutralized features are provided for experts, use them;
+        # otherwise fall back to the same X as the global model.
+        X_in = X_expert if X_expert is not None else X
+        return np.mean([m.predict(X_in) for m in experts], axis=0)
 
     def predict_total(
         self,
         X: np.ndarray,
         regime: str | None,
         moe_boost_lambda: float,
+        X_expert: "np.ndarray | None" = None,
     ) -> np.ndarray:
         g = self.predict_global(X)
-        e = self.predict_expert(regime, X)
+        e = self.predict_expert(regime, X, X_expert=X_expert)
         return g + moe_boost_lambda * e
 
     # ------------------------------------------------------------------
@@ -430,6 +441,8 @@ def walk_forward(
     moe_boost_lambda: float = 0.5,
     moe_hysteresis: int = 3,
     expert_ebm_kwargs: dict | None = None,
+    regime_selector: "RegimeSelector | None" = None,
+    expert_panel: "pd.DataFrame | None" = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, dict | None]:
     """
     Walk-forward EBM training.
@@ -478,18 +491,26 @@ def walk_forward(
     if use_block_bagging:
         print(f"  Block bagging ON: {n_outer_bags} bags  "
               f"block_size={block_size}  embargo_pct={embargo_pct}")
+    print(f"  Temporal validation holdout: last max(target_horizon={target_horizon}, "
+          f"block_size={block_size}) rows per bag (prevents early-stopping leakage)")
 
     # ── MoE initialisation ────────────────────────────────────────────────
     moe_active = False  # set True once regime_col is confirmed present
-    regime_selector: RegimeSelector | None = None
+    # `regime_selector` may be injected from outside (built from the raw panel
+    # before normalize_features, so it reads correct integer regime labels).
+    # If not provided, fall back to building from the current (possibly
+    # normalized) panel — legacy behaviour.
+    _internal_regime_selector: RegimeSelector | None = regime_selector
     if use_moe:
         if regime_col not in panel.columns:
             print(f"  [warn] regime_col='{regime_col}' not found in panel; "
                   f"MoE disabled.")
         else:
             moe_active = True
-            regime_selector = RegimeSelector(
-                panel, regime_col, hysteresis=moe_hysteresis)
+            if _internal_regime_selector is None:
+                _internal_regime_selector = RegimeSelector(
+                    panel, regime_col, hysteresis=moe_hysteresis)
+            regime_selector = _internal_regime_selector
             eff_lambda = moe_boost_lambda
             eff_expert_kwargs = expert_ebm_kwargs or ebm_kwargs
             print(f"  MoE ON: regime_col={regime_col}  "
@@ -512,22 +533,110 @@ def walk_forward(
         """Average predictions across all models in the ensemble."""
         return np.mean([m.predict(X) for m in models], axis=0)
 
-    def _train_ebm_ensemble(X: np.ndarray, y: np.ndarray, kwargs: dict) -> list:
-        """Train a single or block-bagged EBM ensemble. Returns list of models."""
-        if use_block_bagging:
-            kwargs_bag = {**kwargs, "outer_bags": 1}
-            bags = []
-            for _ in range(n_outer_bags):
-                idx = _block_bootstrap_indices(len(X), block_size, rng)
-                m = ExplainableBoostingRegressor(**kwargs_bag)
-                with parallel_backend("sequential"):
-                    m.fit(X[idx], y[idx])
-                bags.append(m)
-            return bags
+    def _make_temporal_bags(
+        n: int, n_bags: int, use_blocks: bool,
+        date_arr: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Build a (n_samples × n_bags) bags matrix with temporal validation.
+
+        When use_blocks=True and date_arr is provided, blocks are sampled in
+        DATE units (block_size consecutive trading days) then expanded to all
+        row indices belonging to those dates.  This ensures each block covers
+        a meaningful temporal window regardless of universe size.
+
+        When use_blocks=False (non-block-bagging path), all training-pool rows
+        are set to +1 for every bag and the tail is set to -1 for validation.
+
+        bags matrix values:
+          +1  training for this bag
+          -1  validation for this bag (temporal holdout)
+           0  excluded from this bag
+        """
+        if use_blocks and date_arr is not None:
+            unique_dates = np.unique(date_arr)
+            n_dates = len(unique_dates)
+            date_to_idx = {d: i for i, d in enumerate(unique_dates)}
+            row_date_idx = np.array([date_to_idx[d] for d in date_arr])
+
+            # val: last val_dates trading days reserved for early-stopping validation
+            val_dates = min(max(target_horizon, block_size),
+                            int(n_dates * 0.1))
+            # date indices [0, cutoff) = train
+            train_date_cutoff = n_dates - val_dates
+
+            train_row_mask = row_date_idx < train_date_cutoff
+
+            mat = np.zeros((n, n_bags), dtype=np.int8)
+            mat[~train_row_mask, :] = -1  # validation rows fixed for all bags
+
+            for b in range(n_bags):
+                # Block bootstrap on DATE indices, then expand to rows
+                sel_date_idx = _block_bootstrap_indices(
+                    train_date_cutoff, block_size, rng)  # date dimension
+                sel_row_mask = np.isin(
+                    row_date_idx, sel_date_idx) & train_row_mask
+                mat[sel_row_mask, b] = 1
+            return mat
         else:
-            m = ExplainableBoostingRegressor(**kwargs)
+
+            if date_arr is not None:
+                unique_dates = np.unique(date_arr)
+                n_dates = len(unique_dates)
+                date_to_idx = {d: i for i, d in enumerate(unique_dates)}
+                row_date_idx = np.array([date_to_idx[d] for d in date_arr])
+                val_dates = min(max(target_horizon, block_size),
+                                int(n_dates * 0.1))
+                train_date_cutoff = n_dates - val_dates
+                train_row_mask = row_date_idx < train_date_cutoff
+                # breakpoint()
+            else:
+                val_size = min(max(target_horizon, block_size), n // 5)
+                train_row_mask = np.ones(n, dtype=bool)
+                train_row_mask[n - val_size:] = False
+                raise ValueError(
+                    "_make_temporal_bags requires date_arr to compute a "
+                    "temporally correct validation split. Passing date_arr=None "
+                    "risks look-forward bias if rows are not sorted by date."
+                )
+
+            mat = np.zeros((n, n_bags), dtype=np.int8)
+            mat[train_row_mask, :] = 1
+            mat[~train_row_mask, :] = -1
+            return mat
+
+    def _train_ebm_ensemble(
+        X: np.ndarray, y: np.ndarray, kwargs: dict,
+        date_arr: np.ndarray | None = None,
+        force_no_bagging: bool = False,
+    ) -> list:
+        """Train a single or block-bagged EBM ensemble. Returns list of models.
+
+        Block-bagging uses a manual bags matrix with date-aware temporal
+        validation: blocks are block_size consecutive trading days, and the
+        validation holdout is the last val_dates × all-symbol rows.
+
+        Non-block-bagging (or force_no_bagging=True) fits a plain EBM on the
+        full training set.  Expert models pass force_no_bagging=True because
+        their per-regime subsets are already small and external bagging would
+        shrink effective training history too aggressively.
+        """
+        n = len(X)
+        if use_block_bagging and not force_no_bagging:
+            bags_matrix = _make_temporal_bags(
+                n, n_outer_bags, use_blocks=True, date_arr=date_arr)
+            kwargs_bag = {**kwargs, "outer_bags": n_outer_bags}
+            m = ExplainableBoostingRegressor(**kwargs_bag)
             with parallel_backend("sequential"):
-                m.fit(X, y)
+                m.fit(X, y, bags=bags_matrix)
+            return [m]
+        else:
+            n_bags = kwargs.get("outer_bags", 8)
+            bags_matrix = _make_temporal_bags(
+                n, n_bags, use_blocks=False, date_arr=date_arr)
+            kwargs_fixed = {**kwargs, "outer_bags": n_bags}
+            m = ExplainableBoostingRegressor(**kwargs_fixed)
+            with parallel_backend("sequential"):
+                m.fit(X, y, bags=bags_matrix)
             return [m]
 
     def _ensemble_importances(model_list: list) -> pd.Series:
@@ -565,22 +674,45 @@ def walk_forward(
             X_train = train_data[feature_cols].values
             y_train = train_data["y"].values
 
+            # If expert_panel is provided (ADX-neutralized), extract aligned
+            # expert features for the same (ts, symbol) rows as train_data.
+            X_train_expert: np.ndarray | None = None
+            if expert_panel is not None:
+                ep_train = (
+                    expert_panel[expert_panel["ts"].isin(train_dates)]
+                    .copy()
+                )
+                ep_train = _fill_features(ep_train)
+                # Align rows to match train_data order via ts+symbol merge
+                ep_train = (
+                    train_data[["ts", "symbol"]]
+                    .reset_index(drop=True)
+                    .merge(ep_train, on=["ts", "symbol"], how="left")
+                )
+                X_train_expert = ep_train[feature_cols].fillna(0.0).values
+
             if not _first_train_logged:
                 print(f"  [info] First model fit at pred_idx={pred_idx} "
                       f"using {len(train_data)} rows ({len(train_dates)} dates × "
-                      f"{len(train_data) // max(len(train_dates), 1)} avg symbols)")
+                      f"{len(train_data) // max(len(train_dates), 1)} avg symbols)"
+                      + (" [global on ADX-neutral, experts on raw features]"
+                         if X_train_expert is not None else ""))
                 _first_train_logged = True
 
             # ── Two-stage MoE training ────────────────────────────────────────
             if moe_active:
-                # Stage 1: Global EBM on full training window
+                # Stage 1: Global EBM on original features
                 global_models = _train_ebm_ensemble(
-                    X_train, y_train, ebm_kwargs)
+                    X_train, y_train, ebm_kwargs,
+                    date_arr=train_data["ts"].values)
                 y_global_pred = np.mean(
                     [m.predict(X_train) for m in global_models], axis=0)
 
-                # Stage 2: Expert EBMs per regime on global residuals
+                # Stage 2: Expert EBMs on residuals.
+                # Use ADX-neutral features if expert_panel was provided,
+                # otherwise fall back to the same X_train as global.
                 y_residuals = y_train - y_global_pred
+                X_for_experts = X_train_expert if X_train_expert is not None else X_train
 
                 # Use actual (non-lagged) regime for IS training
                 train_regime_raw = train_data[regime_col].apply(
@@ -594,18 +726,13 @@ def walk_forward(
                     mask = train_regime_raw == regime_str
                     if mask.sum() < 30:
                         continue
-                    X_reg = X_train[mask]
+                    X_reg = X_for_experts[mask]
                     y_reg = y_residuals[mask]
 
-                    # Use block bagging for experts only when subset is large enough
-                    if use_block_bagging and len(X_reg) > block_size:
-                        expert_models = _train_ebm_ensemble(
-                            X_reg, y_reg, eff_expert_kwargs)
-                    else:
-                        em = ExplainableBoostingRegressor(**eff_expert_kwargs)
-                        with parallel_backend("sequential"):
-                            em.fit(X_reg, y_reg)
-                        expert_models = [em]
+                    expert_models = _train_ebm_ensemble(
+                        X_reg, y_reg, eff_expert_kwargs,
+                        date_arr=train_data["ts"].values[mask],
+                        force_no_bagging=True)
 
                     expert_models_dict[regime_str] = expert_models
                     # Collect expert importances for this fold
@@ -641,7 +768,9 @@ def walk_forward(
 
             # ── Standard single-stage EBM training ───────────────────────────
             else:
-                models = _train_ebm_ensemble(X_train, y_train, ebm_kwargs)
+                models = _train_ebm_ensemble(
+                    X_train, y_train, ebm_kwargs,
+                    date_arr=train_data["ts"].values)
                 y_pred_is = _predict_ensemble(X_train)
 
                 imp_avg = _ensemble_importances(models)
@@ -688,7 +817,20 @@ def walk_forward(
         if moe_active and isinstance(models, ResidualMoE):
             # Use lagged + hysteresis regime to avoid look-ahead
             active_regime = regime_selector.get_regime(pred_date)
-            scores = models.predict_total(X_pred, active_regime, eff_lambda)
+            # Expert inference uses ADX-neutral features if expert_panel provided
+            X_pred_expert: np.ndarray | None = None
+            if expert_panel is not None:
+                ep_pred = expert_panel[expert_panel["ts"] == pred_date].copy()
+                ep_pred = _fill_features(ep_pred)
+                if not ep_pred.empty:
+                    ep_pred = (
+                        pred_data[["ts", "symbol"]]
+                        .reset_index(drop=True)
+                        .merge(ep_pred, on=["ts", "symbol"], how="left")
+                    )
+                    X_pred_expert = ep_pred[feature_cols].fillna(0.0).values
+            scores = models.predict_total(
+                X_pred, active_regime, eff_lambda, X_expert=X_pred_expert)
         else:
             scores = _predict_ensemble(X_pred)
 
@@ -868,6 +1010,99 @@ def plot_report(
 
 
 # ---------------------------------------------------------------------------
+# Per-epoch pipeline helper
+# ---------------------------------------------------------------------------
+
+def _run_epoch_pipeline(panel_epoch, feature_cols, args, ebm_kwargs,
+                        expert_ebm_kwargs, model_dir):
+    """
+    Run the full EBM pipeline (build_target → normalize → walk_forward →
+    neutralize → predictions_to_weights) on a single epoch's panel slice.
+
+    `panel_epoch` must already be filtered to the epoch's active symbols but
+    should contain FULL temporal history so that TS-based feature normalization
+    and rolling lookback windows warm up correctly.
+
+    Returns (weights, predictions_wide, importance_df, fold_stats_df,
+             expert_importance_dfs).
+    """
+    ep = panel_epoch.copy()
+
+    ep = build_target(
+        ep, args.target_col, args.target_horizon, args.target_type,
+        beta_neutral=args.target_beta_neutral, beta_col=args.beta_col,
+    )
+
+    # Build RegimeSelector from the raw (pre-normalization) panel so that
+    # regime column values are still the original integer labels (0/1/2).
+    # normalize_features turns them into rolling z-scores, after which
+    # str(int(z_score)) produces wrong label strings for expert routing.
+    raw_regime_selector = None
+    if args.use_moe and args.regime_col in ep.columns:
+        raw_regime_selector = RegimeSelector(
+            ep, args.regime_col, hysteresis=args.moe_hysteresis)
+
+    ep = normalize_features(
+        ep, feature_cols, args.feature_norm, args.ts_z_window)
+
+    ep_adx = None
+    if args.adx_neutral:
+        ep_adx = neutralize_features_on_adx(
+            ep, feature_cols,
+            adx_col=args.adx_col,
+            window=args.adx_neutral_window,
+        )
+
+    # Global model uses ADX-neutralized features (if --adx_neutral);
+    # experts use raw normalized features to capture regime-specific alpha.
+    main_panel = ep_adx if ep_adx is not None else ep
+    raw_panel_for_experts = ep if ep_adx is not None else None
+
+    (predictions_wide, importance_df,
+     fold_stats_df, _is_rets,
+     expert_importance_dfs) = walk_forward(
+        panel=main_panel,
+        feature_cols=feature_cols,
+        target_col=args.target_col,
+        target_horizon=args.target_horizon,
+        target_type=args.target_type,
+        train_window=args.train_window,
+        retrain_freq=args.retrain_freq,
+        min_train_periods=args.min_train_periods,
+        beta_neutral=args.beta_neutral,
+        beta_col=args.beta_col,
+        quantile=args.quantile,
+        ebm_kwargs=ebm_kwargs,
+        save_models=args.save_models,
+        model_dir=model_dir,
+        use_block_bagging=args.use_block_bagging,
+        n_outer_bags=args.n_outer_bags,
+        block_size=args.block_size,
+        embargo_pct=args.embargo_pct,
+        use_moe=args.use_moe,
+        regime_col=args.regime_col,
+        moe_boost_lambda=args.moe_boost_lambda,
+        moe_hysteresis=args.moe_hysteresis,
+        expert_ebm_kwargs=expert_ebm_kwargs,
+        regime_selector=raw_regime_selector,
+        expert_panel=raw_panel_for_experts,
+    )
+
+    if args.beta_neutral:
+        predictions_wide = neutralize_scores(
+            predictions_wide, main_panel, beta_col=args.beta_col)
+
+    weights = predictions_to_weights(
+        predictions_wide,
+        quantile=args.quantile,
+        max_weight=args.max_weight,
+        weight_mode=args.weight_mode,
+    )
+
+    return weights, predictions_wide, importance_df, fold_stats_df, expert_importance_dfs
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -931,6 +1166,19 @@ def main():
                     action="store_false")
     ap.add_argument("--beta_col",     default="beta_60")
 
+    # --- ADX feature neutralization ------------------------------------------
+    ap.add_argument("--adx_neutral", action="store_true", default=False,
+                    help="Neutralize each feature against market_adx via rolling "
+                         "OLS before training. Removes the systematic component of "
+                         "each feature that co-varies with trending-market strength, "
+                         "leaving the idiosyncratic residual for the model to learn.")
+    ap.add_argument("--adx_col",    default="market_adx",
+                    help="Column name of the market-wide ADX series in the panel "
+                         "(default: market_adx)")
+    ap.add_argument("--adx_neutral_window", type=int, default=30,
+                    help="Rolling window (trading days) for the ADX-beta OLS "
+                         "(default: 252)")
+
     # --- EBM hyperparameters -------------------------------------------------
     ap.add_argument("--max_rounds",           type=int,   default=200)
     ap.add_argument("--max_bins",             type=int,   default=256)
@@ -950,7 +1198,7 @@ def main():
                     help="Replace EBM outer_bags with manual block-bootstrap ensemble")
     ap.add_argument("--n_outer_bags",  type=int,   default=8,
                     help="Number of block-bootstrap bags (only when --use_block_bagging)")
-    ap.add_argument("--block_size",    type=int,   default=21,
+    ap.add_argument("--block_size",    type=int,   default=42,
                     help="Block length in rows for block bootstrap (≈1 trading month)")
     ap.add_argument("--embargo_pct",   type=float, default=0.01,
                     help="Fraction of train window to embargo beyond target_horizon")
@@ -976,6 +1224,9 @@ def main():
     # --- Output --------------------------------------------------------------
     ap.add_argument("--save_models", action="store_true",
                     help="Pickle each fold's EBM model (can be large)")
+    ap.add_argument("--no_rolling_universe", action="store_true",
+                    help="Skip rolling universe epoch mask on weights. "
+                         "Use this to baseline-test EBM signal correctness.")
 
     args = ap.parse_args()
 
@@ -1014,20 +1265,6 @@ def main():
     feature_cols = [c for c in feature_cols if c in panel.columns]
     print(f"\nFeatures ({len(feature_cols)}): {feature_cols}")
 
-    # ── Build target  (MUST precede normalize_features) ──────────────────────
-    print(f"Building target: {args.target_type}({args.target_col}, "
-          f"horizon={args.target_horizon})"
-          + (" [beta-neutral]" if args.target_beta_neutral else ""))
-    panel = build_target(
-        panel, args.target_col, args.target_horizon, args.target_type,
-        beta_neutral=args.target_beta_neutral, beta_col=args.beta_col,
-    )
-
-    # ── Normalize features ────────────────────────────────────────────────────
-    print(f"\nNormalizing features (mode={args.feature_norm})...")
-    panel = normalize_features(
-        panel, feature_cols, args.feature_norm, args.ts_z_window)
-
     # ── Build EBM hyperparameter dicts ────────────────────────────────────────
     ebm_kwargs = dict(
         max_rounds=args.max_rounds,
@@ -1040,6 +1277,8 @@ def main():
         min_samples_leaf=args.min_samples_leaf,
         random_state=args.random_state,
         feature_names=feature_cols,
+        # validation_size=0
+        # smoothing_rounds=120
     )
 
     # Expert EBMs inherit global kwargs but override interactions and optionally lr.
@@ -1059,51 +1298,158 @@ def main():
               f"expert_interactions={args.expert_interactions}  "
               f"hysteresis={args.moe_hysteresis}")
 
-    (predictions_wide, importance_df,
-     fold_stats_df, is_rets,
-     expert_importance_dfs) = walk_forward(
-        panel=panel,
-        feature_cols=feature_cols,
-        target_col=args.target_col,
-        target_horizon=args.target_horizon,
-        target_type=args.target_type,
-        train_window=args.train_window,
-        retrain_freq=args.retrain_freq,
-        min_train_periods=args.min_train_periods,
-        beta_neutral=args.beta_neutral,
-        beta_col=args.beta_col,
-        quantile=args.quantile,
-        ebm_kwargs=ebm_kwargs,
-        save_models=args.save_models,
-        model_dir=model_dir,
-        use_block_bagging=args.use_block_bagging,
-        n_outer_bags=args.n_outer_bags,
-        block_size=args.block_size,
-        embargo_pct=args.embargo_pct,
-        use_moe=args.use_moe,
-        regime_col=args.regime_col,
-        moe_boost_lambda=args.moe_boost_lambda,
-        moe_hysteresis=args.moe_hysteresis,
-        expert_ebm_kwargs=expert_ebm_kwargs,
-    )
-    print(f"  Prediction matrix: {predictions_wide.shape}")
+    # ── Per-epoch training or single global pass ──────────────────────────────
+    # With rolling universe: one EBM trained per epoch using only that epoch's
+    # active symbols, so CS normalization (build_target, normalize_features) and
+    # walk-forward ranking always operate over a consistent symbol set.
+    # Full temporal history is kept per symbol for TS lookback warmup.
+    # Without rolling universe (or --no_rolling_universe): single global pass.
+    ru_epochs = []
+    if not args.no_rolling_universe:
+        ru = RollingUniverse()
+        if not ru.is_empty():
+            start_str = panel["ts"].min().strftime("%Y-%m-%d")
+            end_str = panel["ts"].max().strftime("%Y-%m-%d")
+            ru_epochs = ru.get_epochs(start_str, end_str)
 
-    # ── Beta neutralization of scores (before ranking) ───────────────────────
-    if args.beta_neutral:
-        print(f"\nBeta-neutralizing scores (col={args.beta_col})...")
-        predictions_wide = neutralize_scores(
-            predictions_wide, panel, beta_col=args.beta_col)
-        print("  Done.")
+    if ru_epochs:
+        print(f"\n  Rolling universe: {len(ru_epochs)} epochs — "
+              f"training a separate EBM per epoch.")
+        weight_slices, pred_slices = [], []
+        imp_slices, fold_slices = [], []
+        expert_imp_slices: dict = {}
 
-    # ── Predictions → weights ────────────────────────────────────────────────
-    print(f"\nConverting predictions to weights (mode={args.weight_mode}, "
-          f"Q={args.quantile}, maxW={args.max_weight})...")
-    weights = predictions_to_weights(
-        predictions_wide,
-        quantile=args.quantile,
-        max_weight=args.max_weight,
-        weight_mode=args.weight_mode,
-    )
+        for ep in ru_epochs:
+            ep_start = pd.Timestamp(ep["epoch_start"])
+            ep_end = pd.Timestamp(ep["epoch_end"])
+            ep_syms = ep["symbols"]
+            print(f"\n  ── Epoch {ep['epoch_start']} → {ep['epoch_end']} "
+                  f"({len(ep_syms)} symbols) ──")
+
+            # Full panel history for this epoch's symbols so that TS rolling
+            # windows and feature normalization warm up correctly.
+            panel_ep = panel[panel["symbol"].isin(ep_syms)].copy()
+            if panel_ep.empty:
+                print("    [skip] No panel rows for this epoch's symbols.")
+                continue
+
+            w_ep, pred_ep, imp_ep, fold_ep, exp_ep = _run_epoch_pipeline(
+                panel_ep, feature_cols, args, ebm_kwargs,
+                expert_ebm_kwargs, model_dir,
+            )
+            print(f"    Prediction matrix: {pred_ep.shape}")
+
+            # Slice to active date range only
+            w_ep = w_ep.loc[(w_ep.index >= ep_start) & (w_ep.index <= ep_end)]
+            pred_ep = pred_ep.loc[(pred_ep.index >= ep_start)
+                                  & (pred_ep.index <= ep_end)]
+            weight_slices.append(w_ep)
+            pred_slices.append(pred_ep)
+            if not imp_ep.empty:
+                imp_slices.append(imp_ep)
+            if not fold_ep.empty:
+                fold_slices.append(fold_ep)
+            for regime_str, df in exp_ep.items():
+                expert_imp_slices.setdefault(regime_str, []).append(df)
+
+        all_dates = pd.DatetimeIndex(sorted(panel["ts"].unique()))
+        weights = (
+            pd.concat(weight_slices).reindex(all_dates).fillna(0.0)
+            if weight_slices else pd.DataFrame(0.0, index=all_dates, columns=[])
+        )
+        # predictions_wide: NaN on inactive dates so compute_ic's pred.dropna()
+        # correctly skips them. Using fillna(0.0) would create all-zero rows that
+        # look like constant predictions and cause ConstantInputWarning in spearmanr.
+        predictions_wide = (
+            pd.concat(pred_slices).reindex(all_dates)
+            if pred_slices else pd.DataFrame(index=all_dates)
+        )
+        importance_df = pd.concat(imp_slices) if imp_slices else pd.DataFrame()
+        fold_stats_df = pd.concat(
+            fold_slices) if fold_slices else pd.DataFrame()
+        expert_importance_dfs = {r: pd.concat(
+            dfs) for r, dfs in expert_imp_slices.items()}
+
+        # OOS metrics need y_raw on the full panel. build_target adds it as a
+        # plain forward return shift — no CS normalization, safe to run globally.
+        panel = build_target(
+            panel, args.target_col, args.target_horizon, args.target_type,
+            beta_neutral=False, beta_col=args.beta_col,
+        )
+
+    else:
+        # Single global pass (no rolling universe or --no_rolling_universe)
+        print("\n  [FIXED UNIVERSE] Single global EBM pass.")
+        panel = build_target(
+            panel, args.target_col, args.target_horizon, args.target_type,
+            beta_neutral=args.target_beta_neutral, beta_col=args.beta_col,
+        )
+
+        # Build RegimeSelector from raw panel before normalization corrupts labels.
+        raw_regime_selector = None
+        if args.use_moe and args.regime_col in panel.columns:
+            raw_regime_selector = RegimeSelector(
+                panel, args.regime_col, hysteresis=args.moe_hysteresis)
+
+        panel = normalize_features(
+            panel, feature_cols, args.feature_norm, args.ts_z_window)
+
+        panel_adx = None
+        if args.adx_neutral:
+            panel_adx = neutralize_features_on_adx(
+                panel, feature_cols,
+                adx_col=args.adx_col,
+                window=args.adx_neutral_window,
+            )
+
+        # Global model uses ADX-neutralized features (if --adx_neutral);
+        # experts use raw normalized features to capture regime-specific alpha.
+        main_panel = panel_adx if panel_adx is not None else panel
+        raw_panel_for_experts = panel if panel_adx is not None else None
+
+        (predictions_wide, importance_df,
+         fold_stats_df, _is_rets,
+         expert_importance_dfs) = walk_forward(
+            panel=main_panel,
+            feature_cols=feature_cols,
+            target_col=args.target_col,
+            target_horizon=args.target_horizon,
+            target_type=args.target_type,
+            train_window=args.train_window,
+            retrain_freq=args.retrain_freq,
+            min_train_periods=args.min_train_periods,
+            beta_neutral=args.beta_neutral,
+            beta_col=args.beta_col,
+            quantile=args.quantile,
+            ebm_kwargs=ebm_kwargs,
+            save_models=args.save_models,
+            model_dir=model_dir,
+            use_block_bagging=args.use_block_bagging,
+            n_outer_bags=args.n_outer_bags,
+            block_size=args.block_size,
+            embargo_pct=args.embargo_pct,
+            use_moe=args.use_moe,
+            regime_col=args.regime_col,
+            moe_boost_lambda=args.moe_boost_lambda,
+            moe_hysteresis=args.moe_hysteresis,
+            expert_ebm_kwargs=expert_ebm_kwargs,
+            regime_selector=raw_regime_selector,
+            expert_panel=raw_panel_for_experts,
+        )
+        print(f"  Prediction matrix: {predictions_wide.shape}")
+
+        if args.beta_neutral:
+            print(f"\nBeta-neutralizing scores (col={args.beta_col})...")
+            predictions_wide = neutralize_scores(
+                predictions_wide, main_panel, beta_col=args.beta_col)
+            print("  Done.")
+
+        weights = predictions_to_weights(
+            predictions_wide,
+            quantile=args.quantile,
+            max_weight=args.max_weight,
+            weight_mode=args.weight_mode,
+        )
 
     # ── OOS metrics ──────────────────────────────────────────────────────────
     print("Computing OOS metrics...")

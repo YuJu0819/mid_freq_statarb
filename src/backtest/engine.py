@@ -2,8 +2,32 @@ import pandas as pd
 from ..core.types import Order, BacktestResult
 from ..portfolio.paperbroker import PaperBroker
 import numpy as np
+from scipy import stats as scipy_stats
 from ..core.utils import ensure_dir
 import os
+
+
+def probabilistic_sharpe_ratio(returns: pd.Series, sr_benchmark: float = 0.0) -> float:
+    """
+    Compute the Probabilistic Sharpe Ratio (PSR) — the probability that
+    the true Sharpe ratio exceeds *sr_benchmark*, adjusting for skewness
+    and kurtosis of the observed return series.
+
+    Bailey & López de Prado (2012).
+    """
+    n = len(returns)
+    if n < 3:
+        return np.nan
+    sr = returns.mean() / (returns.std() + 1e-12)
+    skew = float(returns.skew())
+    kurt = float(returns.kurtosis())  # excess kurtosis
+    sr_std = np.sqrt(
+        (1 - skew * sr + (kurt / 4) * sr ** 2) / (n - 1)
+    )
+    if sr_std < 1e-12:
+        return np.nan
+    z = (sr - sr_benchmark) / sr_std
+    return float(scipy_stats.norm.cdf(z))
 
 
 def run_multi_asset(data: dict[str, pd.DataFrame], strategy, cfg: dict) -> BacktestResult:
@@ -160,6 +184,7 @@ def run_multi_asset(data: dict[str, pd.DataFrame], strategy, cfg: dict) -> Backt
         "final_equity": float(eq["equity"].iloc[-1]) if not eq.empty else cfg['backtest']['initial_cash'],
         "return_pct": float((eq["equity"].iloc[-1] / eq["equity"].iloc[0] - 1) * 100) if not eq.empty and eq["equity"].iloc[0] != 0 else 0.0,
         "sharpe_daily": float((ret.mean() / (ret.std() + 1e-12)) * (365 ** 0.5)) if len(eq) > 2 else 0.0,
+        "prob_sharpe_ratio": probabilistic_sharpe_ratio(ret) if len(eq) > 2 else np.nan,
         "daily_win_rate_pct": float((ret > 0).mean() * 100) if not ret.empty else 0.0,
         "trades": int(len(tr))
     }
@@ -167,21 +192,35 @@ def run_multi_asset(data: dict[str, pd.DataFrame], strategy, cfg: dict) -> Backt
     return BacktestResult(equity_curve=eq, trades=tr, summary=summary, score_history=score_df)
 
 
-def run_vectorized_backtest(data: dict[str, pd.DataFrame], strategy, cfg: dict, run_id='default', file_name='default') -> BacktestResult:
+def run_vectorized_backtest(
+    data: dict[str, pd.DataFrame],
+    strategy,
+    cfg: dict,
+    run_id: str = 'default',
+    file_name: str = 'default',
+    epoch_mask_df: "pd.DataFrame | None" = None,
+) -> BacktestResult:
     """
     Calculates PnL using (Signal * Return) - Costs.
     Uses 'generate_all_signals' for true vectorization.
+
+    epoch_mask_df : optional wide boolean DataFrame (index=dates, columns=symbols).
+        True  → symbol is in the active epoch on that date (weight allowed).
+        False → weight forced to 0.  Applied AFTER signal generation so that
+                lookback windows can use pre-epoch price history without penalty.
     """
     initial_cash = cfg["backtest"]["initial_cash"]
     cost_bps = (cfg["backtest"]["fee_bps"] +
                 cfg["backtest"]["slippage_bps"]) / 10000
 
     # 1. Align Prices (for Returns Calculation)
-    all_ts = pd.Index([])
+    # Build as DatetimeIndex explicitly — pd.Index([]).union(...) can produce an
+    # object Index in pandas 2.0+, which prevents epoch_mask_df from aligning.
+    all_ts_set: set = set()
     for df in data.values():
         if not df.empty:
-            all_ts = all_ts.union(df['ts'])
-    all_ts = all_ts.sort_values().unique()
+            all_ts_set.update(df['ts'].tolist())
+    all_ts = pd.DatetimeIndex(sorted(all_ts_set))
 
     # Wide Close Prices
     closes_dict = {sym: df.set_index(
@@ -189,8 +228,41 @@ def run_vectorized_backtest(data: dict[str, pd.DataFrame], strategy, cfg: dict, 
     prices_df = pd.DataFrame(closes_dict).reindex(all_ts).ffill()
 
     # 2. Generate Signals (Vectorized)
+    # epoch_mask_df is forwarded so the strategy can exclude inactive symbols
+    # from cross-sectional operations (rank, z-score) while still using their
+    # pre-epoch price history for rolling lookback computations.
     print("Generating signals (Vectorized)...")
-    weights_df, score_history_df = strategy.generate_all_signals(data)
+    weights_df, score_history_df = strategy.generate_all_signals(
+        data, epoch_mask_df=epoch_mask_df)
+
+    # Apply rolling-universe epoch mask to weights (NOT to input price data).
+    # This lets lookback windows use pre-epoch price history while still
+    # ensuring the portfolio holds 0 weight outside a symbol's active epoch.
+    if epoch_mask_df is not None and not epoch_mask_df.empty:
+        common_syms = weights_df.columns.intersection(epoch_mask_df.columns)
+        if len(common_syms):
+            aligned_mask = epoch_mask_df.reindex(
+                index=weights_df.index, columns=weights_df.columns
+            ).fillna(False)
+            weights_df = weights_df.where(aligned_mask, other=0.0)
+
+            # Apply the same epoch mask to score_history_df so that the
+            # quantile analysis only sees positions the portfolio actually held.
+            if (score_history_df is not None and not score_history_df.empty
+                    and 'ts' in score_history_df.columns
+                    and 'symbol' in score_history_df.columns
+                    and 'position_qty' in score_history_df.columns):
+                # Stack the boolean mask into a long-form Series keyed by (ts, symbol)
+                active_long = aligned_mask.stack()
+                active_long.index.names = ['ts', 'symbol']
+                # Build a lookup index from score_history rows
+                sh_keys = pd.MultiIndex.from_arrays(
+                    [score_history_df['ts'], score_history_df['symbol']],
+                    names=['ts', 'symbol'],
+                )
+                is_active = active_long.reindex(
+                    sh_keys, fill_value=False).values
+                score_history_df.loc[~is_active, 'position_qty'] = 0.0
 
     # NaN means no signal → flatten the position (treat as 0 weight).
     # We deliberately do NOT ffill here: holding a stale weight on missing signal days
@@ -213,8 +285,8 @@ def run_vectorized_backtest(data: dict[str, pd.DataFrame], strategy, cfg: dict, 
 
     # Lag weights by 1: Weights calculated at T act on Returns at T+1
     equity_lag1 = _build_equity(1)
-    equity_lag5 = _build_equity(5)
-    equity_lag10 = _build_equity(10)
+    equity_lag5 = _build_equity(2)
+    equity_lag10 = _build_equity(3)
 
     port_rets_net = (equity_lag1 / equity_lag1.shift(1) - 1).fillna(0.0)
 
@@ -223,8 +295,8 @@ def run_vectorized_backtest(data: dict[str, pd.DataFrame], strategy, cfg: dict, 
 
     eq_df = pd.DataFrame({
         'equity': equity_lag1,
-        'equity_lag5': equity_lag5,
-        'equity_lag10': equity_lag10,
+        'equity_lag2': equity_lag5,
+        'equity_lag3': equity_lag10,
         'ts': equity_lag1.index,
     })
 
@@ -233,6 +305,7 @@ def run_vectorized_backtest(data: dict[str, pd.DataFrame], strategy, cfg: dict, 
         "final_equity": float(equity_curve.iloc[-1]) if not equity_curve.empty else initial_cash,
         "return_pct": float((equity_lag1.iloc[-1] / equity_lag1.iloc[0] - 1) * 100) if not equity_lag1.empty else 0.0,
         "sharpe_daily": float(port_rets_net.mean() / port_rets_net.std() * (365**0.5)) if port_rets_net.std() != 0 else 0.0,
+        "prob_sharpe_ratio": probabilistic_sharpe_ratio(port_rets_net),
         "turnover_avg": float(weights_df.diff().abs().sum(axis=1).fillna(0.0).mean())
     }
 

@@ -9,6 +9,7 @@ import numpy as np
 from tqdm import tqdm
 from ..core.utils import load_config, ensure_dir
 from ..data.binance_futures_rest import fetch_futures_klines
+from ..data.rolling_universe import RollingUniverse, build_symbol_active_mask
 from ..backtest.reporting import plot_equity_curve
 from ..portfolio.optimizer import PortfolioOptimizer
 
@@ -414,6 +415,26 @@ def main():
     # 1. Load Strategy Signals
     strategies, all_ts, all_syms = load_and_align_strategies(
         base_dir, args.strategies)
+
+    # 1b. Safety-net epoch mask — zero weights outside each symbol's active epoch.
+    # Each individual strategy (momentum, reversal, ebm) already applies this mask
+    # at generation time; this pass catches any future strategy that doesn't.
+    ru = RollingUniverse()
+    if not ru.is_empty():
+        ru_epochs = ru.get_epochs(args.start_date, args.end_date)
+        if ru_epochs:
+            print(f"Applying rolling universe epoch mask to loaded strategies "
+                  f"({len(ru_epochs)} epochs)...")
+            for name, df in strategies.items():
+                zeroed = 0
+                for sym in df.columns:
+                    ts_series = pd.Series(df.index, index=df.index)
+                    active = build_symbol_active_mask(sym, ts_series, ru_epochs)
+                    inactive = ~active.values
+                    if inactive.any():
+                        zeroed += int(inactive.sum())
+                        df.loc[inactive, sym] = 0.0
+                print(f"  {name}: zeroed {zeroed:,} inactive (date, symbol) entries.")
 
     # 2. Fetch Market Data
     fetch_start = (pd.to_datetime(args.start_date) -

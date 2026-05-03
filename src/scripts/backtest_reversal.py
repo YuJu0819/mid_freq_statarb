@@ -1,6 +1,7 @@
 from ..backtest.engine import run_vectorized_backtest
 from ..strategy.liquidation_reversal import LiquidationReversalStrategy
 from ..data.universe import load_validated_universe
+from ..data.rolling_universe import RollingUniverse, build_symbol_active_mask
 from ..data.binance_futures_rest import fetch_futures_klines, fetch_top_long_short_ratio
 from ..data.storage import parquet_path, save_bars, load_bars
 from ..core.utils import load_config, ensure_dir
@@ -64,18 +65,28 @@ def main():
         "--config", help="Path to config.yaml", default="config.yaml")
     parser.add_argument(
         "--run_id", help="ID for this backtest run", default="default_run")
+    parser.add_argument(
+        "--no_rolling_universe", action="store_true",
+        help="Force fixed universe from config (bypasses rolling universe). "
+             "Use this to baseline-test strategy correctness.")
     args = parser.parse_args()
     cfg = load_config(args.config)
-    validated = load_validated_universe(args.start_date, args.end_date)
-    if validated is not None:
-        symbols = validated
-        print(f"Loaded validated universe: {len(symbols)} symbols  "
-              f"(run prepare_universe to refresh)")
-    else:
+
+    if args.no_rolling_universe:
         symbols = cfg["backtest"]["symbols"]
-        print(f"WARNING: No validated universe found for {args.start_date}→{args.end_date}. "
-              f"Run 'python -m src.scripts.prepare_universe' first. "
-              f"Falling back to all {len(symbols)} config symbols.")
+        print(f"[FIXED UNIVERSE] Using {len(symbols)} symbols from config "
+              f"(rolling universe disabled).")
+    else:
+        validated = load_validated_universe(args.start_date, args.end_date)
+        if validated is not None:
+            symbols = validated
+            print(f"Loaded validated universe: {len(symbols)} symbols  "
+                  f"(run prepare_universe to refresh)")
+        else:
+            symbols = cfg["backtest"]["symbols"]
+            print(f"WARNING: No validated universe found for {args.start_date}→{args.end_date}. "
+                  f"Run 'python -m src.scripts.prepare_universe' first. "
+                  f"Falling back to all {len(symbols)} config symbols.")
     interval = "1d"
 
     print(f"\n--- Starting Liquidation Reversal Backtest ---")
@@ -195,19 +206,44 @@ def main():
         print("No valid data loaded.")
         return
 
+    # --- Rolling Universe Epoch Mask -------------------------------------
+    # Skipped when --no_rolling_universe is passed (epoch_mask_df stays None,
+    # which the engine and strategy treat as "all symbols always active").
+    import pandas as _pd
+    epoch_mask_df = None
+    if not args.no_rolling_universe:
+        ru = RollingUniverse()
+        if not ru.is_empty():
+            ru_epochs = ru.get_epochs(args.start_date, args.end_date)
+            if ru_epochs:
+                print(
+                    f"\nBuilding rolling universe epoch mask ({len(ru_epochs)} epochs)...")
+                mask_cols = {}
+                for sym, df in all_data.items():
+                    ts_idx = _pd.DatetimeIndex(_pd.to_datetime(df["ts"]))
+                    active = build_symbol_active_mask(sym, df["ts"], ru_epochs)
+                    mask_cols[sym] = _pd.Series(active.values, index=ts_idx)
+                epoch_mask_df = _pd.DataFrame(mask_cols)
+                active_pairs = int(epoch_mask_df.sum().sum())
+                total_pairs = epoch_mask_df.size
+                print(
+                    f"  Active (date, symbol) pairs: {active_pairs:,} / {total_pairs:,}")
+    # ----------------------------------------------------------------------
+
     # --- Strategy Execution ---
     strategy = LiquidationReversalStrategy(
         leverage_scale=1.0,
         oi_level_lookback=30,
-        sentiment_ma_window=40,
-        ts_lookback=80,
-        half_life_decay=12
+        sentiment_ma_window=30,
+        ts_lookback=30,
+        half_life_decay=3
     )
 
     print(f"\nRunning Simulation on {len(all_data)} assets...")
     try:
         res = run_vectorized_backtest(
-            all_data, strategy, cfg, run_id=args.run_id, file_name='reversal')
+            all_data, strategy, cfg, run_id=args.run_id, file_name='reversal',
+            epoch_mask_df=epoch_mask_df)
 
         print("\n" + "="*40)
         print("           BACKTEST RESULTS           ")
@@ -215,12 +251,14 @@ def main():
         print(f"Final Equity:   ${res.summary['final_equity']:,.2f}")
         print(f"Total Return:   {res.summary['return_pct']:.2f}%")
         print(f"Daily Sharpe:   {res.summary['sharpe_daily']:.2f}")
-        # print(f"Win Rate (Day): {res.summary['daily_win_rate_pct']:.2f}%")
+        print(f"PSR:            {res.summary['prob_sharpe_ratio']:.4f}")
         print("="*40)
 
         report_dir = ensure_dir(f"./reports/strategies/{args.run_id}")
-        res.equity_curve.to_csv(os.path.join(report_dir, "equity_curve_reversal.csv"))
-        plot_equity_curve(res.equity_curve, os.path.join(report_dir, "equity_curve_reversal.png"))
+        res.equity_curve.to_csv(os.path.join(
+            report_dir, "equity_curve_reversal.csv"))
+        plot_equity_curve(res.equity_curve, os.path.join(
+            report_dir, "equity_curve_reversal.png"))
 
         # analyze_factor_quantiles needs 'close_price', which the reversal strategy
         # doesn't include in score_history. Join it in from all_data here.
@@ -231,7 +269,8 @@ def main():
                 axis=1
             ).stack().reset_index()
             closes.columns = ['ts', 'symbol', 'close_price']
-            score_df = res.score_history.merge(closes, on=['ts', 'symbol'], how='left')
+            score_df = res.score_history.merge(
+                closes, on=['ts', 'symbol'], how='left')
 
             print("\n==== Cross-Sectional Factor Analysis (Reversal) ====")
             for factor in ['oi_z_score', 'liquidation_shock', 'regime_score', 'interaction_alpha']:

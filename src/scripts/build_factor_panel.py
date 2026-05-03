@@ -81,6 +81,7 @@ from tqdm import tqdm
 from ..core.utils import load_config
 from ..data.loader import DataLoader, _load_local_metrics
 from ..data.universe import load_validated_universe
+from ..data.rolling_universe import RollingUniverse, build_symbol_active_mask
 from .. import factors
 
 
@@ -535,6 +536,10 @@ def main():
                     help="Output directory (default: ./data/ml)")
     ap.add_argument("--no_signals", action="store_true",
                     help="Skip attaching strategy signal columns")
+    ap.add_argument("--no_rolling_universe", action="store_true",
+                    help="Skip rolling universe NaN masking. Use this when "
+                         "building a panel for per-epoch EBM training, which "
+                         "needs the full pre-epoch history for each symbol.")
     args = ap.parse_args()
 
     cfg = load_config()
@@ -580,6 +585,39 @@ def main():
     print("\nComputing factors...")
     panel = compute_factors(mom_data, ls_store, oi_store=oi_store)
     print(f"  Panel shape: {panel.shape}")
+
+    # ── Rolling Universe Mask ─────────────────────────────────────────────────
+    # For each (ts, symbol) row that falls outside the symbol's active epoch,
+    # set all factor columns to NaN. The shape of the panel is unchanged —
+    # inactive entries remain as rows but with NaN values, so the EBM can
+    # distinguish "no signal" from a genuine zero-valued factor.
+    #
+    # IMPORTANT: Skip this when building a panel for per-epoch EBM training
+    # (--no_rolling_universe). The per-epoch pipeline filters to active symbols
+    # itself and needs pre-epoch history for TS rolling warmup. Masking it here
+    # causes the training window to see mostly NaN → avg symbols degrades across
+    # later epochs because their pre-epoch lookback data is zeroed out.
+    if not args.no_rolling_universe:
+        ru = RollingUniverse()
+        if not ru.is_empty():
+            ru_epochs = ru.get_epochs(args.start_date, args.end_date)
+            if ru_epochs:
+                print("\nApplying rolling universe mask to factor panel...")
+                factor_cols = [c for c in panel.columns if c not in ("ts", "symbol")]
+                panel_ts = pd.to_datetime(panel["ts"])
+                active_flag = pd.Series(False, index=panel.index)
+                for ep in ru_epochs:
+                    ep_start = pd.Timestamp(ep["epoch_start"])
+                    ep_end   = pd.Timestamp(ep["epoch_end"]) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                    ep_syms  = set(ep["symbols"])
+                    in_ep = (panel_ts >= ep_start) & (panel_ts <= ep_end) & panel["symbol"].isin(ep_syms)
+                    active_flag |= in_ep
+                n_masked = (~active_flag).sum()
+                panel.loc[~active_flag, factor_cols] = np.nan
+                print(f"  {n_masked:,} rows masked as NaN ({n_masked / len(panel):.1%} of panel).")
+    else:
+        print("\nSkipping rolling universe NaN mask (--no_rolling_universe). "
+              "Full history retained for all symbols.")
 
     # ── Attach strategy signals ───────────────────────────────────────────────
     if not args.no_signals:

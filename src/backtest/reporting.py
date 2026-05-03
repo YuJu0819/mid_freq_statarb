@@ -564,7 +564,8 @@ def analyze_pure_factor_quantiles(
     """
     required = [factor_name, 'close_price', 'symbol', 'ts']
     if score_df.empty or not all(c in score_df.columns for c in required):
-        print(f"\n[Pure Factor] Skipping {factor_name}: missing required columns.")
+        print(
+            f"\n[Pure Factor] Skipping {factor_name}: missing required columns.")
         return
 
     print(f"\n--- Pure Cross-Sectional Factor Analysis: {factor_name} ---")
@@ -578,7 +579,7 @@ def analyze_pure_factor_quantiles(
                 index='ts', columns='symbol', values=col, aggfunc='mean')
 
     factor_wide = _pivot(factor_name)   # signed — no abs()
-    price_wide  = _pivot('close_price')
+    price_wide = _pivot('close_price')
 
     # Forward 1-period return: row t = return earned by holding from t to t+1
     fwd_returns = price_wide.pct_change().shift(-1)
@@ -586,14 +587,15 @@ def analyze_pure_factor_quantiles(
     # Cross-sectional demean: subtract the universe mean return each day.
     # This removes the common market move (beta) so each bucket's performance
     # is measured purely relative to the average asset, not absolute direction.
-    cs_mean     = fwd_returns.mean(axis=1)
+    cs_mean = fwd_returns.mean(axis=1)
     fwd_demeaned = fwd_returns.sub(cs_mean, axis=0)
 
     # Cross-sectional percentile rank of the factor (NaNs excluded automatically)
     cs_ranks = factor_wide.rank(axis=1, pct=True)
 
     stats_list = []
-    fig, axes = plt.subplots(2, 1, figsize=(13, 10), gridspec_kw={'height_ratios': [3, 1]})
+    fig, axes = plt.subplots(2, 1, figsize=(
+        13, 10), gridspec_kw={'height_ratios': [3, 1]})
     ax_cum, ax_ls = axes
     colors = plt.cm.RdYlGn(np.linspace(0, 1, quantiles))
 
@@ -607,17 +609,19 @@ def analyze_pure_factor_quantiles(
             mask = (cs_ranks > lo) & (cs_ranks <= hi)
 
         # Equal-weight mean of demeaned returns — not sum
-        daily_ret  = fwd_demeaned[mask].mean(axis=1).fillna(0.0)
+        daily_ret = fwd_demeaned[mask].mean(axis=1).fillna(0.0)
         bucket_rets[q] = daily_ret
 
-        cum_ret    = daily_ret.cumsum()   # additive since demeaned returns are already ~zero-sum
-        ann_ret    = daily_ret.mean() * 365
-        ann_vol    = daily_ret.std() * (365 ** 0.5)
-        sharpe     = ann_ret / ann_vol if ann_vol > 0 else 0.0
+        # additive since demeaned returns are already ~zero-sum
+        cum_ret = daily_ret.cumsum()
+        ann_ret = daily_ret.mean() * 365
+        ann_vol = daily_ret.std() * (365 ** 0.5)
+        sharpe = ann_ret / ann_vol if ann_vol > 0 else 0.0
         avg_assets = mask.sum(axis=1).mean()
 
         label = f"Q{q+1} ({int(lo*100)}-{int(hi*100)}%)"
-        ax_cum.plot(cum_ret.index, cum_ret, label=label, color=colors[q], linewidth=2)
+        ax_cum.plot(cum_ret.index, cum_ret, label=label,
+                    color=colors[q], linewidth=2)
 
         stats_list.append({
             "Quantile":   f"Q{q+1} ({int(lo*100)}-{int(hi*100)}%)",
@@ -628,10 +632,10 @@ def analyze_pure_factor_quantiles(
         })
 
     # Long-short spread: long top bucket, short bottom bucket
-    ls_daily  = bucket_rets[quantiles - 1] - bucket_rets[0]
-    ls_cum    = ls_daily.cumsum()
-    ls_ann    = ls_daily.mean() * 365
-    ls_vol    = ls_daily.std() * (365 ** 0.5)
+    ls_daily = bucket_rets[quantiles - 1] - bucket_rets[0]
+    ls_cum = ls_daily.cumsum()
+    ls_ann = ls_daily.mean() * 365
+    ls_vol = ls_daily.std() * (365 ** 0.5)
     ls_sharpe = ls_ann / ls_vol if ls_vol > 0 else 0.0
 
     ax_ls.plot(ls_cum.index, ls_cum, color='navy', linewidth=2,

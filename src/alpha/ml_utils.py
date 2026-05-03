@@ -4,6 +4,7 @@ General ML signal utilities — reusable across EBM and other ML strategies.
 Functions
 ---------
 normalize_features          feature normalization (CS / TS / rank / none)
+neutralize_features_on_adx  remove rolling ADX-beta component from each feature
 build_target                forward-return target with optional beta neutralization
 predictions_to_weights      quantile selection + balanced weight assignment
 _beta_neutralize_wide       core OLS residualization (internal helper)
@@ -53,9 +54,16 @@ def normalize_features(
             cs_std = wide.std(axis=1)
             frac_zero_cs = (cs_std < 1e-8).mean()
             if frac_zero_cs > 0.8:
-                # TS z-score: expanding mean/std so time-variation is preserved
-                mu_ts = wide.expanding(min_periods=5).mean()
-                sd_ts = wide.expanding(min_periods=5).std().replace(0, np.nan)
+                # TS z-score: rolling window so stats are not anchored to the
+                # panel's start date.  expanding() would give different values
+                # when the panel is trimmed (per-epoch efficiency trimming
+                # changes the anchor), making results dependent on how much
+                # history is loaded.  rolling(ts_z_window) fixes this: as long
+                # as ts_z_window warmup bars are present before the first
+                # prediction date, the normalized values are identical regardless
+                # of panel start.
+                mu_ts = wide.rolling(ts_z_window, min_periods=ts_z_window // 4).mean()
+                sd_ts = wide.rolling(ts_z_window, min_periods=ts_z_window // 4).std().replace(0, np.nan)
                 wide = (wide - mu_ts) / sd_ts
             elif mode == "cs":
                 mu = wide.mean(axis=1)
@@ -81,6 +89,96 @@ def normalize_features(
             panel = panel.drop(columns=[col]).merge(
                 long, on=["ts", "symbol"], how="left")
 
+    return panel
+
+
+# ---------------------------------------------------------------------------
+# ADX-beta feature neutralization
+# ---------------------------------------------------------------------------
+
+def neutralize_features_on_adx(
+    panel: pd.DataFrame,
+    feature_cols: list[str],
+    adx_col: str = "market_adx",
+    window: int = 252,
+) -> pd.DataFrame:
+    """
+    For each (feature, symbol) pair remove the component that co-varies with
+    market ADX strength via a rolling OLS:
+
+        feature_i(t) = α_i + β_i * adx(t) + residual_i(t)
+
+    The residual replaces the raw feature value.  β_i is the symbol's
+    sensitivity to trending-market conditions; removing it leaves the
+    idiosyncratic part of the feature that is independent of whether the
+    market is in a strong trend or ranging.
+
+    Parameters
+    ----------
+    panel       : long-format panel with columns [ts, symbol, feature_cols..., adx_col]
+    feature_cols: features to neutralize
+    adx_col     : market-wide ADX column (same value for all symbols per date)
+    window      : rolling regression window in trading periods (default 252)
+
+    Implementation
+    --------------
+    Uses the Pearson rolling-covariance formula, fully vectorized:
+
+        roll_cov(feat, adx) = roll_mean(feat * adx) - roll_mean(feat) * roll_mean(adx)
+        slope = roll_cov / roll_var(adx)
+        intercept = roll_mean(feat) - slope * roll_mean(adx)
+        residual = feat - slope * adx - intercept
+
+    Since adx is market-wide (identical across symbols on any date), the ADX
+    rolling statistics (mean, var) are computed once and broadcast.
+    """
+    panel = panel.copy()
+    if adx_col not in panel.columns:
+        print(f"  [adx_neutral] '{adx_col}' not found in panel — skipping.")
+        return panel
+
+    min_p = max(window // 4, 10)
+
+    # ADX is market-wide: take unique ts→adx mapping (same for all symbols)
+    adx_series = (
+        panel[["ts", adx_col]]
+        .drop_duplicates("ts")
+        .set_index("ts")[adx_col]
+        .sort_index()
+    )
+
+    adx_mean = adx_series.rolling(window, min_periods=min_p).mean()
+    adx_var  = adx_series.rolling(window, min_periods=min_p).var().replace(0, np.nan)
+    adx_sq_mean = (adx_series ** 2).rolling(window, min_periods=min_p).mean()
+    # var(adx) = mean(adx²) - mean(adx)² — already handled by .var() above
+
+    neutralized = 0
+    for col in feature_cols:
+        if col not in panel.columns:
+            continue
+
+        wide = panel.pivot(index="ts", columns="symbol", values=col)
+
+        # rolling mean of feature and of feature*adx (vectorized across symbols)
+        feat_mean     = wide.rolling(window, min_periods=min_p).mean()
+        feat_adx_mean = wide.multiply(adx_series, axis=0).rolling(
+            window, min_periods=min_p).mean()
+
+        # rolling cov(feat, adx) = E[feat*adx] - E[feat]*E[adx]
+        roll_cov  = feat_adx_mean.subtract(
+            feat_mean.multiply(adx_mean, axis=0))
+        slope     = roll_cov.divide(adx_var, axis=0)
+        intercept = feat_mean.subtract(slope.multiply(adx_mean, axis=0))
+
+        residual  = wide.subtract(
+            slope.multiply(adx_series, axis=0)).subtract(intercept)
+
+        long = residual.stack(dropna=False).rename(col).reset_index()
+        panel = panel.drop(columns=[col]).merge(long, on=["ts", "symbol"], how="left")
+        neutralized += 1
+
+    print(f"  [adx_neutral] Neutralized {neutralized} features on '{adx_col}' "
+          f"(window={window}).")
     return panel
 
 

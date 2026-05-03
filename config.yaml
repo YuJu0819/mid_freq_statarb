@@ -1,173 +1,168 @@
-# Global runtime config
 general:
-  timezone: "Asia/Taipei"
-  data_dir: "./data"
-  parquet_dir: "./data/parquet"
-  log_level: "INFO"
-
+  timezone: Asia/Taipei
+  data_dir: ./data
+  parquet_dir: ./data/parquet
+  log_level: INFO
 backtest:
-  fee_bps: 10 # 0.10% per trade (maker/taker simplified)
-  slippage_bps: 5 # 0.05% assumed slippage
-  rebalance_period: "1d"
-  initial_cash: 100000 # USDT
-  max_position_notional: 0.7 # proportion of equity
+  fee_bps: 10
+  slippage_bps: 5
+  rebalance_period: 1d
+  initial_cash: 100000
+  max_position_notional: 0.7
   allow_short: true
-
   symbols:
-    [
-      "BTCUSDT",
-      "ETHUSDT",
-      "STOUSDT",
-      "ALPACAUSDT",
-      "SOLUSDT",
-      "XRPUSDT",
-      "XPLUSDT",
-      "NIGHTUSDT",
-      "NOMUSDT",
-      "BNBUSDT",
-      "BNXUSDT",
-      "DOGEUSDT",
-      "ALPHAUSDT",
-      "ZECUSDT",
-      "SOLVUSDT",
-      "EDGEUSDT",
-      "TAOUSDT",
-      "CTSIUSDT",
-      "HYPEUSDT",
-      "ONTUSDT",
-      "PAXGUSDT",
-      "SIRENUSDT",
-      "RIVERUSDT",
-      "ADAUSDT",
-      "PORT3USDT",
-      "AIOTUSDT",
-      "1000PEPEUSDT",
-      "PIPPINUSDT",
-      "UNIUSDT",
-      "FIDAUSDT",
-      "ENAUSDT",
-      "STABLEUSDT",
-      "SUIUSDT",
-      "UXLINKUSDT",
-      "VIDTUSDT",
-      "SXPUSDT",
-      "AVAXUSDT",
-      "AGIXUSDT",
-      "LINKUSDT",
-      "DRIFTUSDT",
-      "ARIAUSDT",
-      "LINAUSDT",
-      "MEMEFIUSDT",
-      "LEVERUSDT",
-      "DOTUSDT",
-      "NEIROETHUSDT",
-      "A2ZUSDT",
-      "BRUSDT",
-      "FTMUSDT",
-      "ALGOUSDT",
-      "BCHUSDT",
-      "DUSDT",
-      "FILUSDT",
-      "NEARUSDT",
-      "WAVESUSDT",
-      "HEMIUSDT",
-      "LTCUSDT",
-      "OMNIUSDT",
-      "KERNELUSDT",
-      "YALAUSDT",
-      "AMBUSDT",
-      "BSWUSDT",
-      "OCEANUSDT",
-      "ONUSDT",
-      "STRAXUSDT",
-      "XAUTUSDT",
-      "ASTERUSDT",
-      "AAVEUSDT",
-      "RENUSDT",
-      "VVVUSDT",
-      "UNFIUSDT",
-      "FETUSDT",
-      "WLDUSDT",
-      "PUMPUSDT",
-      "BANKUSDT",
-      "TRUMPUSDT",
-      "DGBUSDT",
-      "TROYUSDT",
-      "NMRUSDT",
-      "FARTCOINUSDT",
-      "TRXUSDT",
-      "CRVUSDT",
-      "TAGUSDT",
-      "LITUSDT",
-      "HIFIUSDT",
-      "BEATUSDT",
-      "OMUSDT",
-      "RENDERUSDT",
-      "CHESSUSDT",
-      "WIFUSDT",
-      "BARDUSDT",
-      "BLURUSDT",
-      "42USDT",
-      "SNTUSDT",
-      "MUSDT",
-      "MKRUSDT",
-      "ZBTUSDT",
-      "0GUSDT",
-      "XMRUSDT",
-      "PENGUUSDT",
-      "KITEUSDT",
-      "ARBUSDT",
-      "BASEDUSDT",
-      "EPTUSDT",
-      "1000SHIBUSDT",
-      "XLMUSDT",
-      "KATUSDT",
-      "TANSSIUSDT",
-      "SLERFUSDT",
-      "APTUSDT",
-      "HUSDT",
-      "DASHUSDT",
-      "GALAUSDT",
-      "BLZUSDT",
-      "RESOLVUSDT",
-      "SIGNUSDT",
-      "BAKEUSDT",
-      "ETCUSDT",
-      "RVVUSDT",
-      "MONUSDT",
-      "HBARUSDT",
-      "BSBUSDT",
-      "ONDOUSDT",
-      "SEIUSDT",
-      "VIRTUALUSDT",
-      "COMBOUSDT",
-      "1000BONKUSDT",
-      "NULSUSDT",
-      "LOKAUSDT",
-      "AXSUSDT",
-      "CHZUSDT",
-      "CHRUSDT",
-      "RDNTUSDT",
-      "CUSDT",
-      "WLFIUSDT",
-      "KEYUSDT",
-      "DOLOUSDT",
-      "REZUSDT",
-      "OPUSDT",
-      "LDOUSDT",
-      "ROBOUSDT",
-      "PIXELUSDT",
-      "ICPUSDT",
-      "ZENUSDT",
-      "ZROUSDT",
-      "SYNUSDT",
-      "PYTHUSDT",
-      "CYSUSDT",
-      "MAGMAUSDT",
-      "LOOMUSDT",
-    ]
+    - BTCUSDT
+    - ETHUSDT
+    - ALPACAUSDT
+    - SOLUSDT
+    - RAVEUSDT
+    - ORDIUSDT
+    - XRPUSDT
+    - DOGEUSDT
+    - MOVRUSDT
+    - SIRENUSDT
+    - ZECUSDT
+    - 1000PEPEUSDT
+    - BNXUSDT
+    - HYPEUSDT
+    - "\u5E01\u5B89\u4EBA\u751FUSDT"
+    - ALPHAUSDT
+    - BNBUSDT
+    - BASEDUSDT
+    - SOONUSDT
+    - TAOUSDT
+    - ENAUSDT
+    - ADAUSDT
+    - SUIUSDT
+    - PORT3USDT
+    - WLDUSDT
+    - AVAXUSDT
+    - METISUSDT
+    - SAPIENUSDT
+    - LINKUSDT
+    - DOTUSDT
+    - ENJUSDT
+    - AAVEUSDT
+    - FILUSDT
+    - UXLINKUSDT
+    - VIDTUSDT
+    - SXPUSDT
+    - BIOUSDT
+    - AGIXUSDT
+    - PAXGUSDT
+    - NEARUSDT
+    - PNUTUSDT
+    - TRUMPUSDT
+    - LINAUSDT
+    - NEIROUSDT
+    - MEMEFIUSDT
+    - ETHWUSDT
+    - LEVERUSDT
+    - BCHUSDT
+    - EDGEUSDT
+    - NEIROETHUSDT
+    - CRVUSDT
+    - A2ZUSDT
+    - SKYAIUSDT
+    - RAREUSDT
+    - IPUSDT
+    - FTMUSDT
+    - ARBUSDT
+    - HIGHUSDT
+    - TIAUSDT
+    - PUMPUSDT
+    - 1000SATSUSDT
+    - WAVESUSDT
+    - 1000SHIBUSDT
+    - PENGUUSDT
+    - ASTERUSDT
+    - LTCUSDT
+    - GIGGLEUSDT
+    - FARTCOINUSDT
+    - OMNIUSDT
+    - YALAUSDT
+    - AMBUSDT
+    - BSWUSDT
+    - TSTUSDT
+    - OCEANUSDT
+    - PIPPINUSDT
+    - UNIUSDT
+    - FETUSDT
+    - GRIFFAINUSDT
+    - TRXUSDT
+    - XPLUSDT
+    - STRAXUSDT
+    - TAKEUSDT
+    - BLESSUSDT
+    - WLFIUSDT
+    - SIGNUSDT
+    - KSMUSDT
+    - MUSDT
+    - SKLUSDT
+    - WIFUSDT
+    - APTUSDT
+    - VIRTUALUSDT
+    - RENUSDT
+    - 1000BONKUSDT
+    - UNFIUSDT
+    - TRBUSDT
+    - RIVERUSDT
+    - XLMUSDT
+    - PENDLEUSDT
+    - PRLUSDT
+    - DGBUSDT
+    - ONDOUSDT
+    - GENIUSUSDT
+    - TROYUSDT
+    - AXLUSDT
+    - POWERUSDT
+    - MONUSDT
+    - RENDERUSDT
+    - ZETAUSDT
+    - OPUSDT
+    - HBARUSDT
+    - DASHUSDT
+    - HIFIUSDT
+    - EULUSDT
+    - XMRUSDT
+    - OMUSDT
+    - LDOUSDT
+    - XAUTUSDT
+    - STOUSDT
+    - CHESSUSDT
+    - 42USDT
+    - BEATUSDT
+    - SNTUSDT
+    - GALAUSDT
+    - BANDUSDT
+    - MKRUSDT
+    - ARIAUSDT
+    - TRADOORUSDT
+    - EPTUSDT
+    - CLOUSDT
+    - LITUSDT
+    - BERAUSDT
+    - LABUSDT
+    - HUSDT
+    - ROBOUSDT
+    - TONUSDT
+    - PLAYUSDT
+    - TANSSIUSDT
+    - DYDXUSDT
+    - VVVUSDT
+    - SLERFUSDT
+    - CHRUSDT
+    - ETCUSDT
+    - BLZUSDT
+    - ICPUSDT
+    - APRUSDT
+    - BRUSDT
+    - VANAUSDT
+    - BAKEUSDT
+    - CHZUSDT
+    - RVVUSDT
 live:
-  leverage: 3 # Set desired leverage (e.g., 3x)
-  max_position_notional: 0.3 # proportion of equity
-  circuit_breaker_drawdown: 0.1 # 10% from session start -> flat & stop
-  order_type: "MARKET" # simple default
+  leverage: 3
+  max_position_notional: 0.3
+  circuit_breaker_drawdown: 0.1
+  order_type: MARKET

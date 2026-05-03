@@ -15,12 +15,23 @@ Full pre-load pipeline:
     # Step 2 — recent l/s ratio accumulation (run every <=25 days)
     python -m src.scripts.download_ls_ratio
 
-    # Step 3 — validate universe + pre-cache price data  (run per backtest window)
+    # Step 3a — standard mode: validate universe for a fixed date range
     python -m src.scripts.prepare_universe --start_date 2024-01-01 --end_date 2025-12-31
+
+    # Step 3b — rolling mode: validate one universe per snapshot epoch
+    python -m src.scripts.prepare_universe --rolling --start_date 2024-01-01 --end_date 2025-12-31
 
     # Step 4 — backtests (both read the validated universe automatically)
     python -m src.scripts.backtest_multi    --start_date 2024-01-01 --end_date 2025-12-31
     python -m src.scripts.backtest_reversal --start_date 2024-01-01 --end_date 2025-12-31
+
+Rolling mode notes:
+  - Requires at least one snapshot in data/universe_snapshots/ (created by refresh_universe.py).
+  - Saves a separate validated universe YAML per epoch inside data/universe_snapshots/.
+  - Symbols that listed mid-epoch have their expected coverage days adjusted to their actual
+    listing date so they are not penalised for not existing before they were listed.
+  - Also saves the standard per-period universe (union of all epochs) so that existing
+    backtest scripts continue to work without modification.
 """
 import argparse
 import os
@@ -34,6 +45,7 @@ from ..data.binance_rest import fetch_klines as fetch_spot_klines
 from ..data.binance_futures_rest import fetch_futures_klines
 from ..data.storage import parquet_path, save_bars, load_bars
 from ..data.universe import save_validated_universe
+from ..data.rolling_universe import RollingUniverse
 
 METRICS_DIR = "./data/metrics"
 LS_RATIO_DIR = "./data/ls_ratio"
@@ -103,6 +115,73 @@ def _metrics_coverage(symbol: str, start_date: str, end_date: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Rolling-mode epoch validator
+# ---------------------------------------------------------------------------
+
+def _validate_epoch(symbols, epoch_start, epoch_end, parquet_dir, min_coverage,
+                    no_cache, interval="1d"):
+    """
+    Validate a list of symbols for a single epoch [epoch_start, epoch_end].
+
+    Adjusts expected trading days per symbol based on the actual first data
+    date so that mid-epoch listings are not unfairly penalised.
+
+    Returns:
+        results : list of (symbol, fut_cov, spot_ok, metrics_cov, accepted)
+    """
+    results = []
+    n = len(symbols)
+    for i, sym in enumerate(symbols):
+        print(f"  [{i+1}/{n}] {sym} ...", end=" ", flush=True)
+
+        # ---- Futures price ----
+        fut_key   = f"{interval}_{epoch_start}_to_{epoch_end}_reversal_price"
+        fut_cache = parquet_path(parquet_dir, sym, fut_key)
+        df_fut    = None if no_cache else load_bars(fut_cache)
+        if df_fut is None or df_fut.empty:
+            df_fut = fetch_futures_klines(sym, interval, epoch_start, epoch_end)
+            if df_fut is not None and not df_fut.empty:
+                save_bars(df_fut, fut_cache)
+
+        # Adjust expected days: if the data starts after epoch_start, the symbol
+        # was listed mid-epoch; measure coverage from the actual listing, not from
+        # epoch_start, so it is not penalised for not existing before it listed.
+        if df_fut is not None and not df_fut.empty:
+            actual_start = df_fut.index[0].strftime("%Y-%m-%d") if hasattr(df_fut.index[0], "strftime") else epoch_start
+            # Use the later of actual_start and epoch_start as the coverage baseline
+            cov_start = actual_start if actual_start > epoch_start else epoch_start
+        else:
+            cov_start = epoch_start
+        expected = _expected_trading_days(cov_start, epoch_end)
+        fut_cov = _price_coverage(df_fut, expected)
+
+        # ---- Spot price ----
+        spot_sym   = _normalize_spot_symbol(sym)
+        spot_key   = f"{interval}_{epoch_start}_to_{epoch_end}_spot"
+        spot_cache = parquet_path(parquet_dir, spot_sym, spot_key)
+        df_spot    = None if no_cache else load_bars(spot_cache)
+        if df_spot is None or df_spot.empty:
+            df_spot = fetch_spot_klines(spot_sym, interval, epoch_start, epoch_end)
+            if df_spot is not None and not df_spot.empty:
+                save_bars(df_spot, spot_cache)
+        spot_ok = df_spot is not None and not df_spot.empty
+
+        # ---- Metrics ----
+        metrics_cov = _metrics_coverage(sym, epoch_start, epoch_end)
+
+        accepted = fut_cov >= min_coverage
+        results.append((sym, fut_cov, spot_ok, metrics_cov, accepted))
+
+        flag     = "✓" if accepted else "✗"
+        spot_tag = "spot✓" if spot_ok else "spot✗"
+        print(f"{flag}  futures={fut_cov:.0%}  {spot_tag}  metrics={metrics_cov:.0%}")
+
+        time.sleep(0.3)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -121,14 +200,123 @@ def main():
         "--no_cache", action="store_true",
         help="Force re-download of all price data ignoring existing cache.",
     )
+    ap.add_argument(
+        "--rolling", action="store_true",
+        help=(
+            "Rolling universe mode: validate one universe per snapshot epoch "
+            "(requires snapshots in data/universe_snapshots/ from refresh_universe.py). "
+            "Saves per-epoch validated files and also the standard union universe."
+        ),
+    )
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    symbols      = cfg["backtest"]["symbols"]
-    parquet_dir  = cfg["general"]["parquet_dir"]
-    interval     = "1d"
-
+    parquet_dir = cfg["general"]["parquet_dir"]
     ensure_dir(parquet_dir)
+
+    # =========================================================================
+    # ROLLING MODE
+    # =========================================================================
+    if args.rolling:
+        ru = RollingUniverse()
+        if ru.is_empty():
+            print(
+                "ERROR: No snapshots found in data/universe_snapshots/.\n"
+                "Run  python -m src.scripts.refresh_universe --apply  first to create one."
+            )
+            return
+
+        epochs = ru.get_epochs(args.start_date, args.end_date)
+        if not epochs:
+            print(
+                f"ERROR: No snapshots found at all. "
+                f"Run  python -m src.scripts.refresh_universe --apply  first."
+            )
+            return
+
+        print("=" * 60)
+        print("  Universe Preparation  [ROLLING MODE]")
+        print("=" * 60)
+        print(f"  Period    : {args.start_date} → {args.end_date}")
+        print(f"  Epochs    : {len(epochs)}")
+        print(f"  Snapshots : {ru.list_snapshots()}")
+        print(f"  Min cov   : {args.min_coverage:.0%}")
+        print("=" * 60)
+
+        generated    = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        all_accepted = {}   # symbol → first epoch in which it was accepted
+        epoch_paths  = []
+
+        for ep in epochs:
+            ep_start    = ep["epoch_start"]
+            ep_end      = ep["epoch_end"]
+            snap_date   = ep["snapshot_date"]
+            ep_symbols  = ep["symbols"]
+
+            print(f"\n── Epoch {ep_start} → {ep_end}  (snapshot {snap_date}, {len(ep_symbols)} candidates)")
+            results = _validate_epoch(
+                ep_symbols, ep_start, ep_end, parquet_dir,
+                args.min_coverage, args.no_cache,
+            )
+
+            ep_accepted = [s for s, *_, ok in results if ok]
+            ep_rejected = [s for s, *_, ok in results if not ok]
+            ep_low_met  = [
+                s for s, _, _, mc, ok in results
+                if ok and mc < args.min_coverage
+            ]
+
+            print()
+            print(f"  Epoch accepted : {len(ep_accepted)}")
+            if ep_rejected:
+                print(f"  Epoch rejected : {len(ep_rejected)}")
+            if ep_low_met:
+                print(f"  Low metrics    : {ep_low_met}")
+
+            # Save per-epoch validated file
+            ep_path = ru.save_epoch_universe(
+                epoch_start=ep_start,
+                epoch_end=ep_end,
+                snapshot_date=snap_date,
+                symbols=ep_accepted,
+                rejected=ep_rejected,
+                low_metrics_warning=ep_low_met,
+                min_coverage=args.min_coverage,
+                generated=generated,
+            )
+            epoch_paths.append(ep_path)
+            print(f"  Saved → {ep_path}")
+
+            for s in ep_accepted:
+                all_accepted.setdefault(s, ep_start)
+
+        # Save the standard union universe file so existing backtest scripts
+        # (backtest_multi, backtest_reversal, etc.) continue to work unchanged.
+        union_symbols = sorted(all_accepted.keys())
+        std_path = save_validated_universe(
+            start_date=args.start_date,
+            end_date=args.end_date,
+            symbols=union_symbols,
+            rejected=[],
+            low_metrics_warning=[],
+            min_coverage=args.min_coverage,
+            generated=generated,
+        )
+
+        print()
+        print("=" * 60)
+        print(f"  Rolling preparation complete.")
+        print(f"  Epochs saved  : {len(epoch_paths)}")
+        print(f"  Union symbols : {len(union_symbols)} → {std_path}")
+        print("=" * 60)
+        print()
+        return
+
+    # =========================================================================
+    # STANDARD MODE  (unchanged behaviour)
+    # =========================================================================
+    symbols       = cfg["backtest"]["symbols"]
+    interval      = "1d"
     expected_days = _expected_trading_days(args.start_date, args.end_date)
 
     print("=" * 60)
@@ -183,7 +371,7 @@ def main():
     accepted  = [sym for sym, *_, ok in results if ok]
     rejected  = [sym for sym, *_, ok in results if not ok]
     low_metrics = [
-        sym for sym, fc, _, mc, ok in results
+        sym for sym, _fc, _, mc, ok in results
         if ok and mc < args.min_coverage
     ]
 

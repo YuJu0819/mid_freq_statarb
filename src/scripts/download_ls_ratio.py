@@ -70,10 +70,23 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    symbols = cfg.get("backtest", {}).get("symbols", [])
-    if not symbols:
+    config_symbols = cfg.get("backtest", {}).get("symbols", [])
+    if not config_symbols:
         print("No symbols found in config['backtest']['symbols']. Exiting.")
         return
+
+    # Union with all rolling snapshot symbols so that symbols that have dropped
+    # out of config.yaml (but were in earlier epochs) still get L/S ratio data.
+    from ..data.rolling_universe import RollingUniverse
+    ru = RollingUniverse()
+    snapshot_symbols: set = set()
+    for snap_date in ru.list_snapshots():
+        snapshot_symbols.update(ru._load(snap_date))
+
+    if snapshot_symbols:
+        symbols = sorted(snapshot_symbols | set(config_symbols))
+    else:
+        symbols = config_symbols
 
     days = min(args.days, 29)   # cap at 29 days: date truncation to midnight
                                 # means "30 days ago" formatted as YYYY-MM-DD
@@ -89,10 +102,14 @@ def main():
     start_str = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     end_str   = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    n_snaps = len(ru.list_snapshots())
+    sym_source = (f"union of {n_snaps} snapshots + config.yaml"
+                  if n_snaps else "config.yaml")
+
     print("=" * 55)
     print("  Incremental L/S Ratio Download")
     print("=" * 55)
-    print(f"  Symbols  : {len(symbols)}")
+    print(f"  Symbols  : {len(symbols)}  ({sym_source})")
     print(f"  Interval : {args.interval}")
     print(f"  Fetch    : {start_str}  →  {end_str}  (API max 30 days)")
     print(f"  Store    : {LS_RATIO_DIR}/")

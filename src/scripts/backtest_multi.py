@@ -15,6 +15,7 @@ from ..strategy.ad_mom_spot_future import FinalStrategy
 from .. import factors
 from ..strategy.distributed import DistributedStrategy
 from ..data.universe import load_validated_universe
+from ..data.rolling_universe import RollingUniverse, build_symbol_active_mask
 
 
 def load_local_oi_data(symbol, start_date, end_date, data_dir="./data/open_interest"):
@@ -93,18 +94,28 @@ def main():
         "--end_date", help="End date in YYYY-MM-DD format", required=True)
     ap.add_argument(
         "--run_id", help="ID for this backtest run", default="default_run")
+    ap.add_argument(
+        "--no_rolling_universe", action="store_true",
+        help="Force fixed universe from config (bypasses rolling universe). "
+             "Use this to baseline-test strategy correctness.")
     args = ap.parse_args()
     cfg = load_config()
-    validated = load_validated_universe(args.start_date, args.end_date)
-    if validated is not None:
-        symbols = validated
-        print(f"Loaded validated universe: {len(symbols)} symbols  "
-              f"(run prepare_universe to refresh)")
-    else:
+
+    if args.no_rolling_universe:
         symbols = cfg["backtest"]["symbols"]
-        print(f"WARNING: No validated universe found for {args.start_date}→{args.end_date}. "
-              f"Run 'python -m src.scripts.prepare_universe' first. "
-              f"Falling back to all {len(symbols)} config symbols.")
+        print(f"[FIXED UNIVERSE] Using {len(symbols)} symbols from config "
+              f"(rolling universe disabled).")
+    else:
+        validated = load_validated_universe(args.start_date, args.end_date)
+        if validated is not None:
+            symbols = validated
+            print(f"Loaded validated universe: {len(symbols)} symbols  "
+                  f"(run prepare_universe to refresh)")
+        else:
+            symbols = cfg["backtest"]["symbols"]
+            print(f"WARNING: No validated universe found for {args.start_date}→{args.end_date}. "
+                  f"Run 'python -m src.scripts.prepare_universe' first. "
+                  f"Falling back to all {len(symbols)} config symbols.")
     interval = "1d"
 
     # --- Step 1: Prepare Market Regime Data (Basket Proxy) ---
@@ -232,16 +243,40 @@ def main():
         print("No data was successfully loaded. Exiting backtest.")
         return
 
+    # --- Rolling Universe Epoch Mask -------------------------------------
+    # Skipped when --no_rolling_universe is passed (epoch_mask_df stays None,
+    # which the engine and strategy treat as "all symbols always active").
+    epoch_mask_df = None
+    if not args.no_rolling_universe:
+        ru = RollingUniverse()
+        if not ru.is_empty():
+            ru_epochs = ru.get_epochs(args.start_date, args.end_date)
+            if ru_epochs:
+                print(
+                    f"\nBuilding rolling universe epoch mask ({len(ru_epochs)} epochs)...")
+                mask_cols = {}
+                for sym, df in all_data.items():
+                    ts_idx = pd.DatetimeIndex(pd.to_datetime(df["ts"]))
+                    active = build_symbol_active_mask(sym, df["ts"], ru_epochs)
+                    mask_cols[sym] = pd.Series(active.values, index=ts_idx)
+                epoch_mask_df = pd.DataFrame(mask_cols)
+                active_pairs = int(epoch_mask_df.sum().sum())
+                total_pairs = epoch_mask_df.size
+                print(
+                    f"  Active (date, symbol) pairs: {active_pairs:,} / {total_pairs:,}")
+    # ----------------------------------------------------------------------
+
     strat = FinalStrategy(lookback=30, quantile=0.4, min_volume_usd=10_000_000,
                           funding_lookback=180, funding_z_threshold=1.5, trend_ma_length=30,
                           smooth_lookback=10, vol_lookback=30, vol_adj_factor=0.5,
                           inverse_in_weak_regime=True,
-                          conviction_top_fraction=0.33)  # keep top 1/3 by |trend_score| → matches Q3
+                          conviction_top_fraction=None)  # keep top 1/3 by |trend_score| → matches Q3
     # strat = DistributedStrategy(lookback=30)
 
     # res = run_multi_asset(all_data, strat, cfg)
     res = run_vectorized_backtest(
-        all_data, strat, cfg, run_id=args.run_id, file_name='momentum')
+        all_data, strat, cfg, run_id=args.run_id, file_name='momentum',
+        epoch_mask_df=epoch_mask_df)
 
     print("\n==== Summary ====")
     for k, v in res.summary.items():

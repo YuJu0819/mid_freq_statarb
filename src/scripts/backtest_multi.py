@@ -8,7 +8,7 @@ from ..core.utils import load_config
 from ..data.binance_rest import fetch_klines as fetch_spot_klines
 from ..data.binance_futures_rest import fetch_futures_klines
 from ..data.storage import parquet_path, save_bars, load_bars
-from ..backtest.engine import run_multi_asset, run_vectorized_backtest
+from ..backtest.engine import run_multi_asset, run_vectorized_backtest, trim_backtest_result
 from ..backtest.reporting import *
 from ..data.binance_futures_rest import fetch_funding_rate
 from ..strategy.ad_mom_spot_future import FinalStrategy
@@ -98,6 +98,14 @@ def main():
         "--no_rolling_universe", action="store_true",
         help="Force fixed universe from config (bypasses rolling universe). "
              "Use this to baseline-test strategy correctness.")
+    ap.add_argument(
+        "--perf_start_date", default=None,
+        help="Optional. Trim performance reporting to start from this date "
+             "(YYYY-MM-DD). The saved weights parquet still covers the full "
+             "--start_date / --end_date range so downstream consumers (EBM "
+             "factor panel) get full warmup. Only equity curve, Sharpe, "
+             "summary metrics, score-history factor analysis, and plots are "
+             "computed over the trimmed range.")
     args = ap.parse_args()
     cfg = load_config()
 
@@ -220,7 +228,7 @@ def main():
                 merged_df['asset_skewness'] = factors.calc_skewness(
                     merged_df['futures_close'], lookback=90)
 
-                for col in ['open_interest', 'funding_rate', 'basis', 'volume_ratio', 'volatility_regime', 'trend_regime', 'adx', 'skew_regime']:
+                for col in ['open_interest', 'funding_rate', 'basis', 'volume_ratio', 'volatility_regime', 'trend_regime', 'adx', 'skew_regime', 'market_volatility']:
                     if col not in merged_df.columns:
                         if 'regime' in col:
                             merged_df[col] = 'Unknown'
@@ -277,6 +285,13 @@ def main():
     res = run_vectorized_backtest(
         all_data, strat, cfg, run_id=args.run_id, file_name='momentum',
         epoch_mask_df=epoch_mask_df)
+
+    # Trim reporting window if requested. Weights parquet is already saved
+    # with the full date range inside run_vectorized_backtest.
+    if args.perf_start_date:
+        print(f"\n[perf_start_date={args.perf_start_date}] "
+              f"trimming reporting; full weights parquet preserved on disk.")
+        res = trim_backtest_result(res, args.perf_start_date)
 
     print("\n==== Summary ====")
     for k, v in res.summary.items():

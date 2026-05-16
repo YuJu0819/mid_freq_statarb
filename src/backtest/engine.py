@@ -7,7 +7,7 @@ from ..core.utils import ensure_dir
 import os
 
 
-def probabilistic_sharpe_ratio(returns: pd.Series, sr_benchmark: float = 0.0) -> float:
+def probabilistic_sharpe_ratio(returns: pd.Series, sr_benchmark: float = 1.0) -> float:
     """
     Compute the Probabilistic Sharpe Ratio (PSR) — the probability that
     the true Sharpe ratio exceeds *sr_benchmark*, adjusting for skewness
@@ -231,13 +231,28 @@ def run_vectorized_backtest(
     # epoch_mask_df is forwarded so the strategy can exclude inactive symbols
     # from cross-sectional operations (rank, z-score) while still using their
     # pre-epoch price history for rolling lookback computations.
+    #
+    # Strategies return either:
+    #   - 2-tuple (weights, score_history)                   ← legacy
+    #   - 3-tuple (weights_pnl, weights_unmasked, score_history)
+    #
+    # `weights_pnl`: post quality-mask, drives the equity / Sharpe / PnL.
+    # `weights_unmasked`: pre quality-mask (full signal), saved to parquet so
+    # downstream consumers (EBM factor panel) get the complete signal rather
+    # than a backtest-flavored subset.
     print("Generating signals (Vectorized)...")
-    weights_df, score_history_df = strategy.generate_all_signals(
+    signal_result = strategy.generate_all_signals(
         data, epoch_mask_df=epoch_mask_df)
+    if len(signal_result) == 3:
+        weights_df, weights_unmasked_df, score_history_df = signal_result
+    else:
+        # Backward compatibility — older strategies return just (w, scores).
+        weights_df, score_history_df = signal_result
+        weights_unmasked_df = weights_df.copy()
 
     # Apply rolling-universe epoch mask to weights (NOT to input price data).
-    # This lets lookback windows use pre-epoch price history while still
-    # ensuring the portfolio holds 0 weight outside a symbol's active epoch.
+    # This is a TRADABILITY constraint (you cannot hold a non-active symbol),
+    # so it applies to BOTH PnL weights and the EBM-facing unmasked weights.
     if epoch_mask_df is not None and not epoch_mask_df.empty:
         common_syms = weights_df.columns.intersection(epoch_mask_df.columns)
         if len(common_syms):
@@ -245,6 +260,13 @@ def run_vectorized_backtest(
                 index=weights_df.index, columns=weights_df.columns
             ).fillna(False)
             weights_df = weights_df.where(aligned_mask, other=0.0)
+            # Same mask on the unmasked-quality weight matrix
+            aligned_mask_u = epoch_mask_df.reindex(
+                index=weights_unmasked_df.index,
+                columns=weights_unmasked_df.columns,
+            ).fillna(False)
+            weights_unmasked_df = weights_unmasked_df.where(
+                aligned_mask_u, other=0.0)
 
             # Apply the same epoch mask to score_history_df so that the
             # quantile analysis only sees positions the portfolio actually held.
@@ -268,11 +290,22 @@ def run_vectorized_backtest(
     # We deliberately do NOT ffill here: holding a stale weight on missing signal days
     # would silently overleverage the portfolio.
     weights_df = weights_df.reindex(all_ts).fillna(0.0)
+    weights_unmasked_df = weights_unmasked_df.reindex(all_ts).fillna(0.0)
     output_dir = ensure_dir(f"./reports/strategies/{run_id}")
-    weights_path = os.path.join(output_dir, f"{file_name}.parquet")
 
-    weights_df.to_parquet(weights_path)
-    print(f"Weights saved to: {weights_path}")
+    # Save the UNMASKED weights as the primary parquet (read by
+    # build_factor_panel → attached to EBM panel as mom_signal / rev_signal).
+    # The full-signal version gives the ML model the richest information.
+    weights_path = os.path.join(output_dir, f"{file_name}.parquet")
+    weights_unmasked_df.to_parquet(weights_path)
+    print(f"Weights (unmasked, for EBM) saved to: {weights_path}")
+
+    # Also save the traded weights for transparency / debugging. PnL uses
+    # this version. If the user disables quality masking, the two files
+    # are identical and this is harmless.
+    traded_path = os.path.join(output_dir, f"{file_name}_traded.parquet")
+    weights_df.to_parquet(traded_path)
+    print(f"Weights (traded, for PnL)  saved to: {traded_path}")
     # 3. Calculate Vectorized PnL
     returns_df = prices_df.pct_change().fillna(0.0)
 
@@ -314,4 +347,90 @@ def run_vectorized_backtest(
         trades=pd.DataFrame(),  # Empty for vectorized
         summary=summary,
         score_history=score_history_df  # Populated for analysis
+    )
+
+
+def trim_backtest_result(
+    res: BacktestResult,
+    perf_start_date,
+    initial_cash: float = 100_000.0,
+) -> BacktestResult:
+    """
+    Trim a BacktestResult to start from a later date for reporting only.
+
+    Use case: run a backtest with --start_date 2023-01-01 so the SAVED
+    weights parquet contains full 2023+ history (used downstream by the
+    EBM factor panel for warmup), but evaluate / plot / report Sharpe only
+    from 2024-01-01 onwards. The on-disk weights are not modified — only
+    the in-memory `BacktestResult` is sliced.
+
+    Steps:
+      1. Slice equity_curve to ts >= perf_start_date.
+      2. Re-base each equity column so the first kept row equals
+         `initial_cash` (preserves the visual interpretation of the curve).
+      3. Recompute summary metrics (return %, Sharpe, prob-Sharpe) from
+         the trimmed equity series. Turnover is preserved as the full-range
+         average since rebalance frequency is a strategy property, not a
+         period-window property.
+      4. Filter score_history and trades to ts >= perf_start_date.
+    """
+    cutoff = pd.Timestamp(perf_start_date)
+    eq = res.equity_curve
+    if eq is None or eq.empty:
+        return res
+
+    # equity_curve in run_vectorized_backtest is indexed by ts AND has a 'ts'
+    # column. Use the index (it's the canonical time axis everywhere else).
+    eq_index = pd.DatetimeIndex(pd.to_datetime(eq.index))
+    keep_mask = eq_index >= cutoff
+    if not keep_mask.any():
+        print(f"  [trim_backtest_result] No rows >= {cutoff.date()}; "
+              f"returning untrimmed result.")
+        return res
+
+    eq_trim = eq.loc[keep_mask].copy()
+
+    # Re-base equity columns so the first kept row = initial_cash.
+    for col in ('equity', 'equity_lag2', 'equity_lag3'):
+        if col in eq_trim.columns:
+            first = eq_trim[col].iloc[0]
+            if first and first != 0 and not pd.isna(first):
+                eq_trim[col] = eq_trim[col] * (initial_cash / first)
+    if 'ts' in eq_trim.columns:
+        eq_trim['ts'] = eq_trim.index
+
+    # Recompute summary on trimmed primary equity.
+    new_summary = dict(res.summary)
+    if 'equity' in eq_trim.columns and len(eq_trim) > 1:
+        e = eq_trim['equity']
+        rets = (e / e.shift(1) - 1).fillna(0.0)
+        denom = rets.std()
+        sharpe = float(rets.mean() / denom * (365 ** 0.5)) if denom else 0.0
+        new_summary.update({
+            "final_equity": float(e.iloc[-1]),
+            "return_pct": float((e.iloc[-1] / e.iloc[0] - 1) * 100),
+            "sharpe_daily": sharpe,
+            "prob_sharpe_ratio": probabilistic_sharpe_ratio(rets),
+        })
+
+    # Trim score history and trades.
+    score_trim = res.score_history
+    if score_trim is not None and not score_trim.empty and 'ts' in score_trim.columns:
+        score_trim = score_trim[
+            pd.to_datetime(score_trim['ts']) >= cutoff].copy()
+
+    trades_trim = res.trades
+    if (trades_trim is not None and not trades_trim.empty
+            and 'ts' in trades_trim.columns):
+        trades_trim = trades_trim[
+            pd.to_datetime(trades_trim['ts']) >= cutoff].copy()
+
+    print(f"  [trim_backtest_result] Reporting metrics from "
+          f"{eq_trim.index[0].date()} → {eq_trim.index[-1].date()}  "
+          f"({len(eq_trim)} days)")
+    return BacktestResult(
+        equity_curve=eq_trim,
+        trades=trades_trim if trades_trim is not None else pd.DataFrame(),
+        summary=new_summary,
+        score_history=score_trim,
     )

@@ -18,7 +18,7 @@ sys.path.append(os.path.abspath(
 
 # --- CONFIG ---
 # <--- The earliest possible date you want
-GLOBAL_START_DATE = date(2024, 1, 1)
+GLOBAL_START_DATE = date(2023, 1, 1)
 END_DATE = date.today()
 OUTPUT_DIRECTORY = "./data/metrics"
 DAILY_BASE_URL = "https://data.binance.vision/data/futures/um/daily/metrics"

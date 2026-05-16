@@ -40,7 +40,10 @@ Output columns
   rev_final_score               beta-neutralized reversal_hawkes (exact strategy signal)
 
   -- market regime (market-wide, same for all symbols per day) --
-  volatility_regime, trend_regime, skew_regime, market_adx
+  volatility_regime, trend_regime, skew_regime, market_adx, market_volatility
+                                (market_volatility = raw 30d std of EW market
+                                 return; continuous alternative to market_adx
+                                 for neutralization / regime separation)
 
   -- delta family ({factor}_delta) --
   <factor>_delta                fac_mean_5 - fac_mean_5_lag_10 for each base factor.
@@ -89,6 +92,163 @@ from .. import factors
 # Helpers
 # ---------------------------------------------------------------------------
 
+def mask_pre_launch_rows(
+    panel: pd.DataFrame,
+    min_active_days: int = 5,
+    return_col: str = "ret_1d",
+) -> pd.DataFrame:
+    """
+    NaN-mask pre-tradeable rows for each symbol.
+
+    A symbol's price series is "pre-launch" when the underlying data is
+    forward-filled (or zero-filled) before the symbol was actually trading
+    on the venue. In that period `ret_1d == 0` exactly for many consecutive
+    days, which downstream produces all-zero rolling features (volatility_30,
+    price_roc, mom_final_score, ...). Those synthetic-zero rows survive
+    `dropna(subset=["y"])` because y == 0 (not NaN), and end up corrupting
+    EBM training as if they were real observations.
+
+    Detection: for each symbol, find the FIRST date `d*` such that the symbol
+    has accumulated at least `min_active_days` non-zero, non-NaN returns
+    within the panel up to and including `d*`. All rows BEFORE `d*` get
+    every numeric column set to NaN. From `d*` onwards the panel is
+    untouched.
+
+    Parameters
+    ----------
+    panel           : long-format panel with [ts, symbol, return_col, ...]
+    min_active_days : minimum number of non-zero return days before a symbol
+                      is considered tradeable. 5 is enough to distinguish
+                      forward-fill from a low-volume day.
+    return_col      : column used to detect activity (default "ret_1d")
+
+    Returns
+    -------
+    panel : same shape, with pre-launch rows NaN-masked.
+    """
+    if return_col not in panel.columns:
+        print(f"  [pre_launch_mask] '{return_col}' missing — skipping.")
+        return panel
+
+    panel = panel.sort_values(["symbol", "ts"]).reset_index(drop=True)
+    feature_cols = [c for c in panel.columns
+                    if c not in ("ts", "symbol")
+                    and pd.api.types.is_numeric_dtype(panel[c])]
+
+    # For each symbol, find first date where cumulative count of non-zero
+    # returns reaches min_active_days.
+    is_active = (panel[return_col].fillna(0) != 0).astype(int)
+    cum_active = is_active.groupby(panel["symbol"]).cumsum()
+    # Mask rows where cumulative count is still below threshold
+    pre_launch_mask = cum_active < min_active_days
+
+    n_masked = int(pre_launch_mask.sum())
+    if n_masked == 0:
+        print(f"  [pre_launch_mask] no pre-launch rows detected.")
+        return panel
+
+    # Per-symbol first-active date and rows-masked count for reporting.
+    # Distinguish symbols that traded from panel start (lose only ~min_active_days
+    # rows) from genuinely-late-launching symbols.
+    first_active = (panel.loc[~pre_launch_mask]
+                    .groupby("symbol")["ts"].min())
+    rows_masked_per_sym = pre_launch_mask.groupby(panel["symbol"]).sum()
+    panel_start = panel["ts"].min()
+    # "Late-launching" = first active date is more than 30 days after panel start
+    late_syms = first_active[
+        first_active > panel_start + pd.Timedelta(days=30)]
+
+    panel.loc[pre_launch_mask, feature_cols] = np.nan
+    print(f"  [pre_launch_mask] masked {n_masked:,} rows "
+          f"({n_masked/len(panel):.1%} of panel)  "
+          f"threshold = {min_active_days} non-zero return days")
+    print(f"  [pre_launch_mask] {len(late_syms)} symbols launched >30 days "
+          f"after panel start (the contamination source)")
+    if len(late_syms):
+        latest = first_active.loc[late_syms.index].sort_values(
+            ascending=False).head(5)
+        print(f"  [pre_launch_mask] latest-launching: "
+              + ", ".join(f"{s}@{d.strftime('%Y-%m-%d')}"
+                          for s, d in latest.items()))
+    return panel
+
+
+def mask_post_death_rows(
+    panel: pd.DataFrame,
+    min_active_days: int = 5,
+    return_col: str = "ret_1d",
+) -> pd.DataFrame:
+    """
+    NaN-mask post-death (trailing forward-filled) rows for each symbol.
+
+    Symmetric counterpart to mask_pre_launch_rows. After Binance delists or
+    rebrands a symbol (e.g. MATIC→POL, RNDR→RENDER, AGIX→FET, FTM→S), the
+    historical data feed keeps emitting the last close price, producing an
+    indefinite tail of `ret_1d == 0`. Those synthetic-zero rows survive
+    `dropna(subset=["y"])` and pollute training the same way pre-launch
+    rows do.
+
+    Detection: for each symbol, find the LAST date `d*` such that the symbol
+    still has at least `min_active_days` non-zero, non-NaN returns from
+    `d*` onward (i.e., looking forward to panel end). All rows AFTER `d*`
+    get every numeric column set to NaN. Implemented as a reverse cumsum,
+    fully symmetric to the pre-launch helper.
+
+    Parameters
+    ----------
+    panel           : long-format panel with [ts, symbol, return_col, ...]
+    min_active_days : same threshold as pre-launch (default 5)
+    return_col      : column used to detect activity (default "ret_1d")
+
+    Returns
+    -------
+    panel : same shape, with post-death rows NaN-masked.
+    """
+    if return_col not in panel.columns:
+        print(f"  [post_death_mask] '{return_col}' missing — skipping.")
+        return panel
+
+    panel = panel.sort_values(["symbol", "ts"]).reset_index(drop=True)
+    feature_cols = [c for c in panel.columns
+                    if c not in ("ts", "symbol")
+                    and pd.api.types.is_numeric_dtype(panel[c])]
+
+    # For each symbol, count remaining non-zero returns FROM each row to
+    # the symbol's last row (reverse cumsum on the forward-time series).
+    is_active = (panel[return_col].fillna(0) != 0).astype(int)
+    rev_cum = (
+        is_active[::-1]
+        .groupby(panel["symbol"][::-1], sort=False)
+        .cumsum()[::-1]
+    )
+    post_death_mask = rev_cum < min_active_days
+
+    n_masked = int(post_death_mask.sum())
+    if n_masked == 0:
+        print(f"  [post_death_mask] no post-death rows detected.")
+        return panel
+
+    last_active = (panel.loc[~post_death_mask]
+                   .groupby("symbol")["ts"].max())
+    panel_end = panel["ts"].max()
+    # "Dead-tail" = last active date is more than 30 days before panel end
+    dead_syms = last_active[
+        last_active < panel_end - pd.Timedelta(days=30)]
+
+    panel.loc[post_death_mask, feature_cols] = np.nan
+    print(f"  [post_death_mask] masked {n_masked:,} rows "
+          f"({n_masked/len(panel):.1%} of panel)  "
+          f"threshold = {min_active_days} non-zero return days")
+    print(f"  [post_death_mask] {len(dead_syms)} symbols dead >30 days "
+          f"before panel end (the contamination source)")
+    if len(dead_syms):
+        earliest_dead = last_active.loc[dead_syms.index].sort_values().head(5)
+        print(f"  [post_death_mask] earliest deaths: "
+              + ", ".join(f"{s}@{d.strftime('%Y-%m-%d')}"
+                          for s, d in earliest_dead.items()))
+    return panel
+
+
 def _neutralize(signal_df: pd.DataFrame, beta_df: pd.DataFrame) -> pd.DataFrame:
     """Cross-sectional beta-neutralization via OLS residuals (matches strategy)."""
     out = signal_df.copy()
@@ -122,9 +282,35 @@ def _ts_zscore(df: pd.DataFrame, window: int) -> pd.DataFrame:
 
 def _make_wide(data: dict[str, pd.DataFrame], col: str,
                all_ts: pd.Index, fill=np.nan) -> pd.DataFrame:
+    """
+    Build a wide (ts × symbol) DataFrame for `col`.
+
+    Default fill is NaN (changed from 0.0 in older versions). Filling missing
+    raw market data with 0 silently produced corrupted derived factors:
+    `oi_pct_chg` exploded to ±1 or ±inf, `basis = 0` was indistinguishable
+    from "no contango", `volume_ratio = 0` poisoned downstream rolling means.
+
+    Callers that need a specific neutral value (e.g. `ls_ratio` defaults to
+    1.0 when missing) should pass `fill=` explicitly.
+
+    `ffill` is applied so transient one-day gaps don't drop a row, but a
+    symbol that was never tracked stays NaN (no false data is invented).
+    """
     d = {sym: df.set_index("ts")[col]
          for sym, df in data.items() if col in df.columns}
     return pd.DataFrame(d).reindex(all_ts).ffill().fillna(fill)
+
+
+def _ffill_with_limit(df: pd.DataFrame, limit_days: int = 5) -> pd.DataFrame:
+    """
+    Forward-fill with a hard limit on consecutive NaN streaks.
+
+    A 1-2 day API outage should not cascade into a full row drop, but a
+    week-long gap is real and should remain NaN so downstream rolling
+    computations and the EBM training drop the row rather than learn from
+    invented data.
+    """
+    return df.ffill(limit=limit_days)
 
 
 def _stack(wide: pd.DataFrame, name: str) -> pd.Series:
@@ -155,7 +341,10 @@ def compute_factors(
     mom_lookback: int = 30,
     smooth_lookback: int = 10,
     vol_lookback: int = 30,
-    funding_lookback: int = 180,
+    # 120 days (≈1 quarter) is sufficient to capture funding regime in
+    # crypto and shortens warmup vs the previous 180d default. Reduces the
+    # under-warmed training fraction at the start of the OOS window.
+    funding_lookback: int = 120,
     funding_z_threshold: float = 1.5,
     beta_lookback: int = 60,
     # matches LiquidationReversalStrategy(ts_lookback=80) in backtest_reversal
@@ -166,6 +355,10 @@ def compute_factors(
     rev_regime_threshold: float = 0.6,
     # matches LiquidationReversalStrategy(half_life_decay=12)
     rev_halflife: int = 12,
+    # Reduced from 90d to 45d — see compute_factors note on skewness.
+    skew_lookback: int = 45,
+    # Rolling window for liquidity smoothing (dollar volume).
+    liquidity_lookback: int = 30,
 ) -> pd.DataFrame:
     """
     Returns a long-format DataFrame indexed by (ts, symbol) with all factor columns.
@@ -181,30 +374,41 @@ def compute_factors(
     symbols = list(mom_data.keys())
 
     # ── 2. Wide raw frames ───────────────────────────────────────────────────
+    # All raw market series default to NaN where data is genuinely missing.
+    # Earlier the defaults were 0.0, which corrupted downstream:
+    #   - basis = 0 looked like "no contango" for symbols with no spot feed
+    #   - oi = 0 → oi_pct_chg = ±1 or ±inf
+    #   - volume_ratio = 0 poisoned rolling means
+    # ffill(limit=5) lets us survive 1-2 day API outages without dropping
+    # rows, but a multi-week gap stays NaN.
     closes = _make_wide(mom_data, "futures_close", all_ts)
-    basis_wide = _make_wide(mom_data, "basis",          all_ts, fill=0.0)
-    vr_wide = _make_wide(mom_data, "volume_ratio",   all_ts, fill=0.0)
-    fr_wide = _make_wide(mom_data, "funding_rate",   all_ts, fill=0.0)
+    basis_wide = _make_wide(mom_data, "basis", all_ts, fill=np.nan)
+    vr_wide = _make_wide(mom_data, "volume_ratio", all_ts, fill=np.nan)
+    fr_wide = _make_wide(mom_data, "funding_rate", all_ts, fill=np.nan)
+
+    # Liquidity feed: futures volume in BASE units; later we multiply by close
+    # to get dollar volume. NaN-default is correct here too.
+    fv_wide = _make_wide(mom_data, "futures_volume", all_ts, fill=np.nan)
 
     # OI: prefer metrics_store (full historical archive) over mom_data
-    # mom_data["open_interest"] is often 0 because _load_local_oi() used the
-    # wrong filename pattern ({symbol}-metrics-{date}.csv vs the actual
-    # {symbol}_metrics_{date}.csv), so it silently returned empty and the
-    # momentum loader fell back to filling open_interest = 0.0.
+    # because the on-disk metrics CSVs were the canonical source, while
+    # mom_data["open_interest"] often defaulted to 0 from a loader fallback.
+    # NaN where unavailable, never synthetic 0 (which made oi_pct_chg=±inf).
     if oi_store:
         oi_wide_dict = {}
         for sym in symbols:
             if sym in oi_store and not oi_store[sym].empty:
-                oi_wide_dict[sym] = oi_store[sym].reindex(
-                    all_ts).ffill().fillna(0.0)
+                oi_wide_dict[sym] = (oi_store[sym].reindex(all_ts)
+                                     .ffill(limit=5))
             else:
-                oi_wide_dict[sym] = pd.Series(0.0, index=all_ts)
+                oi_wide_dict[sym] = pd.Series(np.nan, index=all_ts)
         oi_wide = pd.DataFrame(oi_wide_dict)
     else:
-        oi_wide = _make_wide(mom_data, "open_interest", all_ts, fill=0.0)
+        oi_wide = _make_wide(mom_data, "open_interest", all_ts, fill=np.nan)
 
     # Regime columns are market-wide (same for all symbols each day)
-    regime_cols = ["volatility_regime", "trend_regime", "skew_regime", "adx"]
+    regime_cols = ["volatility_regime", "trend_regime", "skew_regime", "adx",
+                   "market_volatility"]
     regime_frames = []
     for col in regime_cols:
         if col in next(iter(mom_data.values()), pd.DataFrame()).columns:
@@ -228,70 +432,134 @@ def compute_factors(
     ls_wide = pd.DataFrame(ls_wide_dict)
 
     # ── 3. Price-based factors ───────────────────────────────────────────────
+    # All raw factors propagate NaN: a missing input must result in a missing
+    # output, never a synthetic zero. Final NaN→neutral fills happen ONLY at
+    # training time (`_fill_features` after CS-normalization), where 0 means
+    # "at the cross-sectional mean" rather than a real-world data value.
 
     ret_1d = closes.pct_change(1)
     ret_5d = closes.pct_change(5)
     ret_20d = closes.pct_change(20)
 
-    volatility = factors.calc_volatility(closes, vol_lookback).fillna(0.0)
-    active_vol = volatility.replace(0.0, np.nan)
-    vol_rank_cs = active_vol.rank(axis=1, pct=True).fillna(0.5)
+    # Volatility: NaN until `vol_lookback // 2` days of valid returns exist.
+    volatility = factors.calc_volatility(closes, vol_lookback)
 
-    skewness_90 = factors.calc_skewness(closes, lookback=90)
+    # Cross-sectional rank of volatility — keep NaN where vol is NaN. The
+    # previous .fillna(0.5) silently planted dead/early symbols at the median,
+    # creating a synthetic spike at rank=0.5 that EBM would learn from.
+    vol_rank_cs = volatility.rank(axis=1, pct=True)
+
+    # Skewness: lookback reduced from 90d → 45d. The 90d window was too
+    # smooth for daily prediction (signal barely moved day-to-day) and
+    # required a long warmup. 45d still captures multi-week tail asymmetry
+    # while emitting a meaningfully time-varying value.
+    skewness_45 = factors.calc_skewness(closes, lookback=skew_lookback)
 
     beta_60 = factors.calc_beta_df(closes, beta_lookback)
 
-    # ── 4. Momentum factors ──────────────────────────────────────────────────
-    price_roc = factors.calc_price_mom(
-        closes,  mom_lookback, smooth_lookback).fillna(0.0)
-    oi_roc = factors.calc_oi_mom(
-        oi_wide,    mom_lookback, smooth_lookback).fillna(0.0)
-    basis_mom = factors.calc_basis_mom(
-        basis_wide, closes, mom_lookback, smooth_lookback).fillna(0.0)
-    vol_ratio_s = factors.calc_vol_ratio_signal(
-        vr_wide, mom_lookback, mom_lookback).fillna(1.0)
-    funding_z = factors.calc_funding_zscore(
-        fr_wide, funding_lookback).fillna(0.0)
+    # ── 3b. Liquidity features (NEW) ────────────────────────────────────────
+    # In crypto cross-section, dollar volume is one of the strongest single
+    # predictors of forward return dispersion (mean-reversion in mega-caps,
+    # momentum in mid-caps, noise in low-caps). Without it the EBM cannot
+    # distinguish a $50M-volume coin from a $50K-volume coin — they're
+    # treated identically in the ranking.
+    dollar_volume = closes * fv_wide
+    # 30d rolling mean smooths idiosyncratic single-day spikes (e.g.
+    # listing day, news event). NaN where insufficient warmup.
+    dv_30d_mean = dollar_volume.rolling(
+        liquidity_lookback, min_periods=max(liquidity_lookback // 2, 5)
+    ).mean()
+    # log1p stabilises the skew (volume distributions span 6+ orders of
+    # magnitude) — feeds the EBM an ML-friendly numeric scale.
+    liquidity_log = np.log1p(dv_30d_mean.clip(lower=0))
+    # Cross-sectional percentile rank — symbol-comparable per date.
+    liquidity_rank_cs = dv_30d_mean.rank(axis=1, pct=True)
 
-    basis_norm = (basis_wide / closes.replace(0, np.nan)).fillna(0.0)
+    # ── 4. Momentum factors ──────────────────────────────────────────────────
+    # All NaN-propagating: a missing OI on a day yields NaN oi_roc that day,
+    # not a synthetic 0 that biases CS normalization on that date.
+    price_roc = factors.calc_price_mom(closes, mom_lookback, smooth_lookback)
+    oi_roc = factors.calc_oi_mom(oi_wide, mom_lookback, smooth_lookback)
+    basis_mom = factors.calc_basis_mom(
+        basis_wide, closes, mom_lookback, smooth_lookback)
+    # vol_ratio_signal now returns tanh(diff) ∈ (-1, 1), no exponential blowup.
+    vol_ratio_s = factors.calc_vol_ratio_signal(
+        vr_wide, mom_lookback, mom_lookback)
+    funding_z = factors.calc_funding_zscore(fr_wide, funding_lookback)
+
+    # basis_norm: use NaN division (no synthetic 0). Closes are always > 0
+    # in valid rows after the pre-launch mask runs, so we just guard against
+    # the residual case.
+    safe_closes = closes.where(closes > 0, np.nan)
+    basis_norm = basis_wide / safe_closes
+    # 3-day smoothed companion. The instantaneous `basis_norm` can flip sign
+    # on funding settlements; a 3-day mean captures the structural carry
+    # rather than the daily noise around it. min_periods=2 keeps coverage
+    # high without requiring the full window.
+    basis_norm_smooth3 = basis_norm.rolling(3, min_periods=2).mean()
 
     trend_score = price_roc * (1 + 2 * oi_roc)
 
-    valid_sent = ~(np.isinf(basis_mom) | np.isinf(vol_ratio_s))
-    sentiment_raw = (basis_mom * vol_ratio_s * 5).where(valid_sent, 0.0)
+    # Sentiment: NaN-safe product. Old code did `.where(valid_sent, 0.0)`
+    # which planted 0s on every infinity row → CS-mean bias. Now multiplication
+    # naturally propagates NaN, and any inf gets replaced explicitly.
+    sentiment_raw = (basis_mom * vol_ratio_s * 5).replace(
+        [np.inf, -np.inf], np.nan)
     sentiment_score = _neutralize(sentiment_raw, trend_score)
 
     combined_score = trend_score + sentiment_score
 
-    # Funding penalty
+    # Funding penalty: removed the buggy "kill near zero" clause. Previously
+    # any |funding_z| < 0.15 (i.e. neutral funding, the normal market state)
+    # halved the signal — punishing the most common condition for no reason.
+    # Boost when funding aligns extremely with signal direction, kill only
+    # when funding strongly disagrees.
     funding_penalty = pd.DataFrame(1.0, index=combined_score.index,
                                    columns=combined_score.columns)
     boost = ((funding_z > funding_z_threshold) & (combined_score > 0)) | \
             ((funding_z < -funding_z_threshold) & (combined_score < 0))
     kill = ((funding_z < -funding_z_threshold*2) & (combined_score > 0)) | \
-        ((funding_z > funding_z_threshold*2) & (combined_score < 0)) | \
-        (funding_z.abs() < funding_z_threshold * 0.1)
+           ((funding_z > funding_z_threshold*2) & (combined_score < 0))
     funding_penalty[boost] = 1.5
     funding_penalty[kill] = 0.5
 
     mom_final_score = _neutralize(combined_score, beta_60)
 
     # ── 5. Reversal factors ──────────────────────────────────────────────────
+    # oi_pct_chg propagates NaN naturally now (no synthetic-0 OI).
     oi_pct_chg = oi_wide.pct_change().replace([np.inf, -np.inf], np.nan)
     ls_chg_1d = ls_wide.diff()
+
+    # 3-day smoothed companions for the noisiest single-day-change features.
+    # Daily OI changes can swing ±20% from a single large position; daily L/S
+    # ratio diffs jump on news. A 3-day rolling mean captures sustained
+    # build/unwind while filtering single-day noise. Both originals are kept
+    # as features so the EBM can learn which timescale is more predictive
+    # for any given regime.
+    oi_pct_chg_smooth3 = oi_pct_chg.rolling(3, min_periods=2).mean()
+    ls_chg_smooth3 = ls_chg_1d.rolling(3, min_periods=2).mean()
 
     cs_z_oi = _cs_zscore(oi_pct_chg)
     ts_z_oi = _ts_zscore(cs_z_oi, rev_ts_lookback)
     liq_shock = (-ts_z_oi - 0.5).clip(lower=0.0)
 
-    # Regime: (short_MA - long_MA) / long_std, cs-masked
-    ma_long = closes.rolling(rev_sentiment_ma).mean()
-    std_long = closes.rolling(rev_sentiment_ma).std()
+    # Regime score: keep raw value; SOFT-mask via tanh of CS-z-score instead
+    # of hard-thresholding the bottom 60% to exact 0.
+    # The old hard-threshold collapsed continuous information into a step
+    # function with a synthetic spike at zero, which EBM can't differentiate
+    # from a real "neutral" signal. The tanh weighting preserves gradient
+    # while down-weighting weak cross-sectional outliers.
+    ma_long = closes.rolling(
+        rev_sentiment_ma, min_periods=max(rev_sentiment_ma // 2, 10)).mean()
+    std_long = closes.rolling(
+        rev_sentiment_ma, min_periods=max(rev_sentiment_ma // 2, 10)).std()
     regime_score_raw = ((closes.rolling(rev_regime_window).mean() - ma_long)
-                        / std_long).clip(-3, 3).fillna(0.0)
+                        / std_long.replace(0, np.nan)).clip(-3, 3)
     regime_cs = _cs_zscore(regime_score_raw)
-    regime_score = regime_score_raw.mask(
-        regime_cs.abs() < rev_regime_threshold, 0.0)
+    # tanh(z / threshold) is ~0 at the median, ~±1 at the tails: continuous,
+    # bounded, gradient-preserving.
+    regime_weight = np.tanh(regime_cs / rev_regime_threshold)
+    regime_score = regime_score_raw * regime_weight
 
     interaction_alpha = liq_shock * regime_score
     rev_hawkes = interaction_alpha.ewm(
@@ -304,11 +572,11 @@ def compute_factors(
     #          and rev_hawkes (interaction_alpha_delta already captures this).
     #
     # Also skipped: factors whose underlying lookback >= 40 days.
-    # A 10-day delta on a 40-90d stat changes by only ~10/W of the window
+    # A 10-day delta on a 40+ d stat changes by only ~10/W of the window
     # per step, producing a near-constant, smoothed signal with little
     # cross-sectional discriminatory power:
     #   beta_60        (60d rolling beta)
-    #   skewness_90    (90d rolling skewness)
+    #   skewness_45    (45d rolling skewness — was 90d, still slow vs delta)
     #   funding_z      (180d rolling z-score)
     #   liquidation_shock  (built from an 80d TS z-score)
     #   regime_score   (40d rolling MA in denominator)
@@ -327,6 +595,7 @@ def compute_factors(
         (mom_final_score,   "mom_final_score"),  # 30d composite
         (ls_wide,           "ls_ratio"),         # daily
         (rev_final_score,   "rev_final_score"),  # EWM halflife=12, responsive
+        (liquidity_rank_cs, "liquidity_rank_cs"),  # CS-rank of 30d $-volume
     ]
     delta_parts = [
         _stack(_delta(wide), f"{name}_delta")
@@ -342,12 +611,16 @@ def compute_factors(
         _stack(volatility,      "volatility_30"),
         _stack(vol_rank_cs,     "vol_rank_cs"),
         _stack(beta_60,         "beta_60"),
-        _stack(skewness_90,     "skewness_90"),
+        _stack(skewness_45,     "skewness_45"),
+        # liquidity (NEW)
+        _stack(liquidity_log,    "liquidity_log"),
+        _stack(liquidity_rank_cs, "liquidity_rank_cs"),
         # momentum
         _stack(price_roc,       "price_roc"),
         _stack(oi_roc,          "oi_roc"),
-        _stack(basis_norm,      "basis_norm"),
-        _stack(basis_mom,       "basis_mom"),
+        _stack(basis_norm,        "basis_norm"),
+        _stack(basis_norm_smooth3, "basis_norm_smooth3"),  # 3d smoothed
+        _stack(basis_mom,         "basis_mom"),
         _stack(vol_ratio_s,     "vol_ratio_sig"),
         _stack(trend_score,     "trend_score"),
         _stack(sentiment_score, "sentiment_score"),
@@ -357,8 +630,10 @@ def compute_factors(
         _stack(mom_final_score, "mom_final_score"),
         # reversal
         _stack(ls_wide,         "ls_ratio"),
-        _stack(ls_chg_1d,       "ls_chg_1d"),
-        _stack(oi_pct_chg,      "oi_pct_chg_1d"),
+        _stack(ls_chg_1d,         "ls_chg_1d"),
+        _stack(ls_chg_smooth3,    "ls_chg_smooth3"),     # 3d smoothed
+        _stack(oi_pct_chg,        "oi_pct_chg_1d"),
+        _stack(oi_pct_chg_smooth3, "oi_pct_chg_smooth3"),  # 3d smoothed
         _stack(cs_z_oi,         "cs_z_oi_chg"),
         _stack(ts_z_oi,         "ts_z_oi_chg"),
         _stack(liq_shock,       "liquidation_shock"),
@@ -540,6 +815,39 @@ def main():
                     help="Skip rolling universe NaN masking. Use this when "
                          "building a panel for per-epoch EBM training, which "
                          "needs the full pre-epoch history for each symbol.")
+    ap.add_argument("--no_prelaunch_mask", action="store_true",
+                    help="Skip pre-launch NaN masking. By default, rows where "
+                         "a symbol's price was forward-filled (pre-launch) "
+                         "have all numeric features set to NaN so they get "
+                         "dropped at training time. Use this flag to keep "
+                         "the raw zero-filled rows for inspection / debugging.")
+    ap.add_argument("--no_postdeath_mask", action="store_true",
+                    help="Skip post-death NaN masking. By default, trailing "
+                         "forward-filled rows (after a symbol is delisted or "
+                         "rebranded — e.g. MATIC→POL, FTM→S) are NaN-masked "
+                         "symmetrically to pre-launch. Use this flag to keep "
+                         "the dead-tail rows.")
+    ap.add_argument("--prelaunch_min_active_days", type=int, default=5,
+                    help="Minimum non-zero return days before a symbol is "
+                         "considered tradeable. Used by both pre-launch and "
+                         "post-death masks. Rows outside the active range "
+                         "are NaN-masked.")
+    ap.add_argument("--vol_threshold_mode", choices=["expanding", "rolling"],
+                    default="expanding",
+                    help="How the volatility_regime quantile thresholds are "
+                         "estimated. 'expanding' (default) uses full history "
+                         "up to t-1; 'rolling' uses trailing "
+                         "--vol_threshold_window days (more adaptive to "
+                         "regime shifts in crypto). A/B test by running this "
+                         "script once per mode — the output filename includes "
+                         "the mode suffix to prevent overwrite.")
+    ap.add_argument("--vol_threshold_window", type=int, default=45,
+                    help="Trailing window for 'rolling' mode (default 504 = 2y).")
+    ap.add_argument("--vol_threshold_min_periods", type=int, default=45,
+                    help="Warmup before first non-NaN regime label.")
+    # Note: label-flicker hysteresis is NOT a panel-build knob. The trainer
+    # applies it at use time via `--moe_hysteresis` (RegimeSelector), which
+    # keeps it sweepable without rebuilding the panel.
     args = ap.parse_args()
 
     cfg = load_config()
@@ -558,6 +866,9 @@ def main():
         local_oi_dir=cfg.get("data", {}).get("oi_dir", "./data/open_interest"),
         local_metrics_dir=cfg.get("data", {}).get(
             "metrics_dir", "./data/metrics"),
+        vol_threshold_mode=args.vol_threshold_mode,
+        vol_threshold_window=args.vol_threshold_window,
+        vol_threshold_min_periods=args.vol_threshold_min_periods,
     )
 
     print("\nLoading momentum data (this uses the cache when available)...")
@@ -586,6 +897,29 @@ def main():
     panel = compute_factors(mom_data, ls_store, oi_store=oi_store)
     print(f"  Panel shape: {panel.shape}")
 
+    # ── Pre-launch NaN masking ────────────────────────────────────────────────
+    # Symbols whose price data was forward-filled before they actually started
+    # trading produce all-zero rolling features that survive dropna(y) and
+    # corrupt EBM training. Mask those rows so they become NaN → y becomes
+    # NaN at build_target time → row gets dropped.
+    if not args.no_prelaunch_mask:
+        print("\nMasking pre-launch (forward-filled) rows...")
+        panel = mask_pre_launch_rows(
+            panel, min_active_days=args.prelaunch_min_active_days)
+    else:
+        print("\nSkipping pre-launch mask (--no_prelaunch_mask).")
+
+    # ── Post-death NaN masking ────────────────────────────────────────────────
+    # Symmetric to pre-launch: after a symbol is delisted/rebranded the data
+    # feed keeps emitting the last close → indefinite ret_1d == 0 tail. Same
+    # contamination pattern, fixed the same way.
+    if not args.no_postdeath_mask:
+        print("\nMasking post-death (delisted/rebranded) rows...")
+        panel = mask_post_death_rows(
+            panel, min_active_days=args.prelaunch_min_active_days)
+    else:
+        print("\nSkipping post-death mask (--no_postdeath_mask).")
+
     # ── Rolling Universe Mask ─────────────────────────────────────────────────
     # For each (ts, symbol) row that falls outside the symbol's active epoch,
     # set all factor columns to NaN. The shape of the panel is unchanged —
@@ -603,18 +937,22 @@ def main():
             ru_epochs = ru.get_epochs(args.start_date, args.end_date)
             if ru_epochs:
                 print("\nApplying rolling universe mask to factor panel...")
-                factor_cols = [c for c in panel.columns if c not in ("ts", "symbol")]
+                factor_cols = [
+                    c for c in panel.columns if c not in ("ts", "symbol")]
                 panel_ts = pd.to_datetime(panel["ts"])
                 active_flag = pd.Series(False, index=panel.index)
                 for ep in ru_epochs:
                     ep_start = pd.Timestamp(ep["epoch_start"])
-                    ep_end   = pd.Timestamp(ep["epoch_end"]) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-                    ep_syms  = set(ep["symbols"])
-                    in_ep = (panel_ts >= ep_start) & (panel_ts <= ep_end) & panel["symbol"].isin(ep_syms)
+                    ep_end = pd.Timestamp(
+                        ep["epoch_end"]) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                    ep_syms = set(ep["symbols"])
+                    in_ep = (panel_ts >= ep_start) & (
+                        panel_ts <= ep_end) & panel["symbol"].isin(ep_syms)
                     active_flag |= in_ep
                 n_masked = (~active_flag).sum()
                 panel.loc[~active_flag, factor_cols] = np.nan
-                print(f"  {n_masked:,} rows masked as NaN ({n_masked / len(panel):.1%} of panel).")
+                print(
+                    f"  {n_masked:,} rows masked as NaN ({n_masked / len(panel):.1%} of panel).")
     else:
         print("\nSkipping rolling universe NaN mask (--no_rolling_universe). "
               "Full history retained for all symbols.")
@@ -625,7 +963,19 @@ def main():
         panel = attach_signals(panel, args.run_id)
 
     # ── Save ──────────────────────────────────────────────────────────────────
-    out_name = f"factor_panel_{args.start_date}_{args.end_date}.parquet"
+    # Filename includes the vol-threshold mode so an A/B run (expanding vs
+    # rolling) produces two distinct parquets that downstream consumers
+    # (train_ebm_signal, backtest) can point at independently. The legacy
+    # filename (no suffix) is preserved for the default 'expanding' mode so
+    # existing scripts keep working.
+    if args.vol_threshold_mode == "expanding":
+        suffix = ""
+    elif args.vol_threshold_mode == "rolling":
+        suffix = f"_volroll{args.vol_threshold_window}"
+    else:
+        suffix = f"_vol{args.vol_threshold_mode}"
+    out_name = (f"factor_panel_{args.start_date}_{args.end_date}"
+                f"{suffix}.parquet")
     out_path = os.path.join(args.out_dir, out_name)
     panel.to_parquet(out_path, index=False)
 

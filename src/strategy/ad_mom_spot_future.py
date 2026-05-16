@@ -451,18 +451,28 @@ class FinalStrategy:
         weights = (weights_long.fillna(0.0) + weights_short.fillna(0.0)).clip(
             -MAX_WEIGHT_PER_ASSET, MAX_WEIGHT_PER_ASSET)
 
+        # Preserve the pre-mask weights for downstream EBM consumption.
+        # Two parallel weight matrices from this point forward:
+        #   - `weights`          → post quality-mask (Q1 zeroed) → traded / PnL
+        #   - `weights_unmasked` → full signal preserved          → EBM panel
+        # The quality mask reflects a TRADING decision (skip weakest-signal
+        # bucket to reduce noise / cost). For ML, we want the EBM to see the
+        # full signal distribution so it can learn the value of all buckets.
+        weights_unmasked = weights.copy()
+
         # Mask Q1 of trend score among traded assets — keep only Q2 and Q3.
         # Uses abs(trend_score) ranked within the traded set, which exactly
         # matches the reporting's analyze_factor_quantiles bucketing logic
         # (reporting does: factor_wide.abs() → rank within is_traded).
         # Q1 = weakest signal magnitude → zero out; Q2+Q3 = kept.
         is_traded = weights != 0
-        abs_trend_traded = trend_score.abs().where(is_traded)   # NaN for non-traded
+        abs_trend_traded = volatility.abs().where(is_traded)   # NaN for non-traded
         abs_trend_pct = abs_trend_traded.rank(axis=1, pct=True)
-        q1_mask = is_traded & (abs_trend_pct <= (1.0 / 2))
+        q1_mask = is_traded & (abs_trend_pct >= (1.0 / 3))
         weights = weights.where(~q1_mask, 0.0)
 
-        # Build long-format score history
+        # Build long-format score history (uses TRADED weights so factor
+        # quantile analysis reflects what the strategy actually held).
         def _stack(wide: pd.DataFrame, name: str) -> pd.Series:
             s = wide.stack()
             s.index.names = ['ts', 'symbol']
@@ -480,7 +490,7 @@ class FinalStrategy:
             _stack(closes_wide,     'close_price'),
         ], axis=1).reset_index()
 
-        return weights, score_history_df
+        return weights, weights_unmasked, score_history_df
 
     def generate_all_signals(self, data: Dict[str, pd.DataFrame], epoch_mask_df=None) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
@@ -520,7 +530,10 @@ class FinalStrategy:
             epoch_date_ranges.append((ep_start, ep_end, list(sym_set)))
 
         # --- Per-epoch signal computation ---
+        # Collect both masked (for PnL) and unmasked (for EBM) weight slices
+        # per epoch, then concatenate independently.
         weight_slices = []
+        weight_unmasked_slices = []
         score_slices = []
 
         for ep_start, ep_end, active_symbols in epoch_date_ranges:
@@ -530,33 +543,35 @@ class FinalStrategy:
             print(f"  [Momentum] Epoch {ep_start.date()} → {ep_end.date()} "
                   f"({len(active_symbols)} symbols)")
 
-            weights_ep, scores_ep = self._compute_signals_for_symbols(
-                data, active_symbols)
+            weights_ep, weights_unmasked_ep, scores_ep = \
+                self._compute_signals_for_symbols(data, active_symbols)
 
-            weights_slice = weights_ep.loc[
-                (weights_ep.index >= ep_start) & (weights_ep.index <= ep_end)
-            ]
+            date_mask = (
+                (weights_ep.index >= ep_start) & (weights_ep.index <= ep_end))
+            weights_slice = weights_ep.loc[date_mask]
+            weights_unmasked_slice = weights_unmasked_ep.loc[date_mask]
             scores_slice = scores_ep[
                 (scores_ep['ts'] >= ep_start) & (scores_ep['ts'] <= ep_end)
             ]
 
             weight_slices.append(weights_slice)
+            weight_unmasked_slices.append(weights_unmasked_slice)
             score_slices.append(scores_slice)
 
         if not weight_slices:
             empty_w = pd.DataFrame(0.0, index=epoch_mask_df.index,
                                    columns=epoch_mask_df.columns)
-            return empty_w, pd.DataFrame()
+            return empty_w, empty_w.copy(), pd.DataFrame()
 
-        # Concatenate and reindex to full date range
-        final_weights = (
-            pd.concat(weight_slices)
-            .reindex(all_dates)
-            .fillna(0.0)
-        )
-        final_weights = final_weights.reindex(
-            columns=epoch_mask_df.columns, fill_value=0.0)
+        # Concatenate and reindex to full date range — both versions
+        def _assemble(slices):
+            out = (pd.concat(slices)
+                   .reindex(all_dates)
+                   .fillna(0.0))
+            return out.reindex(columns=epoch_mask_df.columns, fill_value=0.0)
 
+        final_weights = _assemble(weight_slices)
+        final_weights_unmasked = _assemble(weight_unmasked_slices)
         final_scores = pd.concat(score_slices, ignore_index=True)
 
-        return final_weights, final_scores
+        return final_weights, final_weights_unmasked, final_scores

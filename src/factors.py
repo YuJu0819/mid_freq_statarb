@@ -35,10 +35,41 @@ def calculate_adx(df: pd.DataFrame, length: int = 14):
     return adx
 
 
-def calc_market_regimes(market_data: Dict[str, pd.DataFrame]):
+def calc_market_regimes(
+    market_data: Dict[str, pd.DataFrame],
+    vol_threshold_mode: str = "expanding",
+    vol_threshold_window: int = 504,
+    vol_threshold_min_periods: int = 120,
+):
     """
-    Calculates market-wide regimes (vol, trend, skew) using an equal-weighted 
+    Calculates market-wide regimes (vol, trend, skew) using an equal-weighted
     basket of assets (e.g., BTC, ETH, SOL) as the proxy.
+
+    Parameters
+    ----------
+    vol_threshold_mode : {"expanding", "rolling"}
+        How the 25/75 percentile thresholds for the `volatility_regime` label
+        are estimated.
+          "expanding" (default — backwards compatible) — full history up to
+              t-1; stable but anchors thresholds to old regimes (a 2021-vol
+              tail can make "High Vol" near-unreachable in calm 2024).
+          "rolling"   — trailing `vol_threshold_window` days only; adapts to
+              regime shifts in crypto where the vol distribution is
+              non-stationary, at the cost of noisier label boundaries.
+    vol_threshold_window : int
+        Window for "rolling" mode (default 504 ≈ 2y of daily data). Ignored
+        in "expanding" mode.
+    vol_threshold_min_periods : int
+        Warmup before the first non-NaN threshold (default 120). Applies to
+        both modes.
+
+    Note
+    ----
+    Label-flicker around thresholds is handled at the training stage via
+    `RegimeSelector(hysteresis=...)` in `train_ebm_signal.py` (CLI flag
+    `--moe_hysteresis`). Don't duplicate that here — the trainer's value is
+    a sweepable hyperparam, while a value baked into the panel locks it into
+    the artifact and stacks on top of `--moe_hysteresis` at use time.
     """
     returns_list = []
     adx_list = []
@@ -68,16 +99,48 @@ def calc_market_regimes(market_data: Dict[str, pd.DataFrame]):
     # FIX: Initialize with None for name to avoid conflict, then reset_index later
     regimes_df = pd.DataFrame(index=market_returns.index)
 
-    # Volatility
+    # Volatility — quantile thresholds computed via EXPANDING (point-in-time)
+    # to eliminate look-ahead bias. Previously we used the full-panel quantile,
+    # which leaked the future distribution of volatility back into past regime
+    # labels. Now each date's threshold uses only the data available up to and
+    # including the previous day.
+    #
+    # Warmup = 120 days of valid 30-day vol observations (≈ 1 quarter of
+    # crypto market history) — long enough to estimate quartiles meaningfully
+    # but short enough that the regime label is available within ~5 months
+    # from panel start, leaving cleaner training rows for the EBM.
     volatility = market_returns.rolling(window=30).std()
-    vol_low_q = volatility.quantile(0.25)
-    vol_high_q = volatility.quantile(0.75)
+
+    if vol_threshold_mode == "expanding":
+        vol_low_q = (volatility.expanding(min_periods=vol_threshold_min_periods)
+                     .quantile(0.25).shift(1))
+        vol_high_q = (volatility.expanding(min_periods=vol_threshold_min_periods)
+                      .quantile(0.75).shift(1))
+    elif vol_threshold_mode == "rolling":
+        vol_low_q = (volatility.rolling(
+            window=vol_threshold_window,
+            min_periods=vol_threshold_min_periods)
+            .quantile(0.25).shift(1))
+        vol_high_q = (volatility.rolling(
+            window=vol_threshold_window,
+            min_periods=vol_threshold_min_periods)
+            .quantile(0.75).shift(1))
+    else:
+        raise ValueError(
+            f"vol_threshold_mode must be 'expanding' or 'rolling', "
+            f"got {vol_threshold_mode!r}")
 
     regimes_df['volatility_regime'] = 'Medium Volatility'
     regimes_df.loc[volatility < vol_low_q,
                    'volatility_regime'] = 'Low Volatility'
     regimes_df.loc[volatility > vol_high_q,
                    'volatility_regime'] = 'High Volatility'
+
+    # Raw continuous market volatility (30d rolling std of equal-weighted market
+    # return). Exposed so downstream consumers can use it as a continuous
+    # neutralization variable (parallel to `adx`), instead of the 3-level
+    # categorical `volatility_regime`.
+    regimes_df['market_volatility'] = volatility
 
     # Trend
     regimes_df['adx'] = market_adx
@@ -100,7 +163,7 @@ def calc_market_regimes(market_data: Dict[str, pd.DataFrame]):
         # Assuming the first column is the time index
         regimes_df.rename(columns={regimes_df.columns[0]: 'ts'}, inplace=True)
 
-    return regimes_df[['ts', 'volatility_regime', 'trend_regime', 'skew_regime', 'adx']]
+    return regimes_df[['ts', 'volatility_regime', 'trend_regime', 'skew_regime', 'adx', 'market_volatility']]
 
 # --- Per-Asset Factors (Unchanged) ---
 
@@ -122,23 +185,52 @@ def calc_basis_mom(basis, prices, lookback: int, smooth_lookback: int):
 
 
 def calc_vol_ratio_signal(volume_ratio, rolling_lookback: int, diff_lookback: int):
-    vol_ratio_diff = volume_ratio.rolling(
-        rolling_lookback).mean().diff(diff_lookback)
-    return 2 ** vol_ratio_diff.fillna(0.0)
+    """
+    Smooth signed momentum of futures/spot volume ratio.
+
+    Previously this returned 2^diff which is mathematically explosive — a diff
+    of 5 maps to 32, a diff of 20 maps to ~1M. Cold-start data could push
+    values to 7×10^5, contaminating downstream multiplications. We now bound
+    the signal to (-1, 1) via tanh, preserving sign and monotonicity but
+    preventing any single observation from dominating.
+
+    NaN propagates: missing inputs → missing output (no implicit fillna).
+    """
+    vol_ratio_diff = (volume_ratio.rolling(
+        rolling_lookback, min_periods=max(rolling_lookback // 2, 5)
+    ).mean().diff(diff_lookback))
+    return np.tanh(vol_ratio_diff)
 
 
 def calc_funding_zscore(funding_rates, lookback: int):
     mean = funding_rates.rolling(lookback, min_periods=20).mean()
     std = funding_rates.rolling(
-        lookback, min_periods=20).std().replace(0, 1e-12)
+        lookback, min_periods=20).std().replace(0, np.nan)
     return (funding_rates - mean) / std
 
 
-def calc_cs_zscore(target):
-    target = target.replace(0, np.nan)
-    mean = np.mean(target, axis=0)
-    std = np.std(target, axis=0)
-    return (target - mean) / std
+def calc_cs_zscore(target: pd.DataFrame) -> pd.DataFrame:
+    """
+    True cross-sectional z-score (per-date, across symbols).
+
+    PREVIOUSLY BUGGY: the old implementation collapsed axis=0 (the time axis),
+    yielding each symbol's all-time mean/std — that meant every value carried
+    look-ahead bias from its own future. The function name said "cross-
+    sectional" but the math was per-symbol time-series. Strategy code calling
+    this was therefore using future information.
+
+    Now: subtract the row mean (across symbols on that date) and divide by
+    the row std. NaN values are skipped — they neither distort the mean nor
+    inflate variance. Zero is treated as a real value (the previous
+    `replace(0, NaN)` step erased legitimate zero observations from the
+    cross-section, biasing the mean upward for any factor where 0 is common).
+    """
+    if not isinstance(target, pd.DataFrame):
+        raise TypeError(
+            "calc_cs_zscore expects a wide (ts × symbol) DataFrame")
+    mu = target.mean(axis=1, skipna=True)
+    sd = target.std(axis=1, skipna=True).replace(0, np.nan)
+    return target.sub(mu, axis=0).div(sd, axis=0)
 
 
 def calc_beta_df(closes_wide, lookback):

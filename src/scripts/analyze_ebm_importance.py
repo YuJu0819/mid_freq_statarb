@@ -22,7 +22,9 @@ Usage:
   python -m src.scripts.analyze_ebm_importance --run_id batch_v1 --top_n 15
 """
 import argparse
+import glob
 import os
+import re
 
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
@@ -289,6 +291,205 @@ def print_report(result: pd.DataFrame, top_n: int):
     print(sep2)
 
 
+# ── global-vs-expert comparison ──────────────────────────────────────────────
+
+_EXPERT_RE = re.compile(r"ebm_expert_importance_regime_(.+)\.csv$")
+
+
+def discover_experts(run_dir: str) -> dict[str, str]:
+    """{regime_label: filepath} for every expert CSV in run_dir."""
+    found = {}
+    for path in sorted(glob.glob(os.path.join(
+            run_dir, "ebm_expert_importance_regime_*.csv"))):
+        m = _EXPERT_RE.search(os.path.basename(path))
+        if m:
+            found[m.group(1)] = path
+    return found
+
+
+def _parse_to_result(imp_df: pd.DataFrame) -> pd.DataFrame:
+    res, _, _ = parse_importances(imp_df)
+    return classify_quadrants(res)
+
+
+def build_comparison(run_dir: str) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    """
+    Returns
+    -------
+    cmp_df  : feature × {global, expert_*} matrix with combined importance,
+              rank per model, and rank-shift columns vs the global model.
+    per_model : {model_name: full result DataFrame from classify_quadrants}
+    """
+    global_imp = load_importance(run_dir)
+    global_res = _parse_to_result(global_imp)
+    per_model = {"global": global_res}
+
+    for label, path in discover_experts(run_dir).items():
+        exp_imp = pd.read_csv(path, index_col=0)
+        per_model[f"expert_{label}"] = _parse_to_result(exp_imp)
+
+    # Align on union of features so missing → NaN, not silent reindex to 0.
+    feats = sorted({f for r in per_model.values() for f in r.index})
+    cmp_df = pd.DataFrame(index=feats)
+    for name, res in per_model.items():
+        cmp_df[f"{name}_combined"] = res["combined"].reindex(feats)
+        cmp_df[f"{name}_main"] = res["mean_main"].reindex(feats)
+        cmp_df[f"{name}_interact"] = res["mean_interact"].reindex(feats)
+        cmp_df[f"{name}_rank"] = (
+            res["combined"].reindex(feats).rank(ascending=False, method="min"))
+        cmp_df[f"{name}_quad"] = res["quadrant"].reindex(feats)
+
+    # Rank shift per expert vs global. Positive = expert ranks feature
+    # higher (smaller rank number) than global.
+    for name in per_model:
+        if name == "global":
+            continue
+        cmp_df[f"{name}_rank_shift_vs_global"] = (
+            cmp_df["global_rank"] - cmp_df[f"{name}_rank"])
+
+    # Dominant model per feature: which model assigns the highest combined imp.
+    combined_cols = [c for c in cmp_df.columns if c.endswith("_combined")]
+    dom = cmp_df[combined_cols].idxmax(axis=1).str.replace("_combined", "",
+                                                          regex=False)
+    cmp_df["dominant_model"] = dom
+
+    # Cross-model dispersion: high = strong pattern difference.
+    norm = cmp_df[combined_cols].div(
+        cmp_df[combined_cols].max(axis=0).replace(0, np.nan), axis=1)
+    cmp_df["xmodel_dispersion"] = norm.std(axis=1)
+
+    return cmp_df, per_model
+
+
+def print_compare_report(cmp_df: pd.DataFrame, per_model: dict, top_n: int):
+    sep = "═" * 84
+    print(f"\n{sep}")
+    print("  GLOBAL vs EXPERT IMPORTANCE COMPARISON")
+    print(sep)
+    models = list(per_model.keys())
+    print(f"  Models compared: {', '.join(models)}")
+    print(f"  Features       : {len(cmp_df)}")
+    print(sep)
+
+    # Per-model top-N
+    for name in models:
+        col = f"{name}_combined"
+        top = cmp_df[col].sort_values(ascending=False).head(top_n)
+        print(f"\n  TOP {top_n} for {name}")
+        print("  " + "─" * 60)
+        for feat, val in top.items():
+            quad = cmp_df.loc[feat, f"{name}_quad"]
+            print(f"    {feat:<30s} {val:>10.4f}   {quad}")
+
+    # Features with biggest rank-shift vs global, per expert
+    expert_names = [m for m in models if m != "global"]
+    if expert_names:
+        print(f"\n  RANK SHIFT vs GLOBAL  (positive = expert ranks higher)")
+        print("  " + "─" * 60)
+        for name in expert_names:
+            shift_col = f"{name}_rank_shift_vs_global"
+            up = cmp_df[shift_col].nlargest(top_n // 2 or 5)
+            down = cmp_df[shift_col].nsmallest(top_n // 2 or 5)
+            print(f"\n   ▲ {name} elevates:")
+            for feat, sh in up.items():
+                gr = cmp_df.loc[feat, "global_rank"]
+                er = cmp_df.loc[feat, f"{name}_rank"]
+                print(f"      {feat:<30s}  global #{int(gr):>3d}  → "
+                      f"expert #{int(er):>3d}   (Δ={int(sh):+d})")
+            print(f"   ▼ {name} demotes:")
+            for feat, sh in down.items():
+                gr = cmp_df.loc[feat, "global_rank"]
+                er = cmp_df.loc[feat, f"{name}_rank"]
+                print(f"      {feat:<30s}  global #{int(gr):>3d}  → "
+                      f"expert #{int(er):>3d}   (Δ={int(sh):+d})")
+
+    # Highest cross-model dispersion (= biggest pattern differences)
+    print(f"\n  TOP {top_n} CROSS-MODEL DISPERSION  (largest pattern differences)")
+    print("  " + "─" * 60)
+    head = cmp_df.sort_values("xmodel_dispersion", ascending=False).head(top_n)
+    combined_cols = [c for c in cmp_df.columns if c.endswith("_combined")]
+    label = "Feature".ljust(30) + "  " + "  ".join(
+        f"{c.replace('_combined',''):>10s}" for c in combined_cols)
+    print("  " + label + "   dispersion")
+    for feat, row in head.iterrows():
+        vals = "  ".join(f"{row[c]:>10.4f}" for c in combined_cols)
+        print(f"  {feat:<30s}  {vals}   {row['xmodel_dispersion']:>6.3f}")
+    print(sep)
+
+
+def plot_compare(cmp_df: pd.DataFrame, per_model: dict,
+                 top_n: int, out_path: str):
+    models = list(per_model.keys())
+    combined_cols = [f"{m}_combined" for m in models]
+
+    # Union of top-N per model — features that ever rank high anywhere
+    union = set()
+    for m in models:
+        union.update(cmp_df[f"{m}_combined"]
+                     .sort_values(ascending=False).head(top_n).index)
+    union = sorted(union, key=lambda f: -cmp_df.loc[f, "global_combined"])
+
+    n_experts = len(models) - 1
+    fig = plt.figure(figsize=(18, max(8, 0.35 * len(union) + 4)))
+    gs = gridspec.GridSpec(
+        2, max(2, n_experts), figure=fig, hspace=0.45, wspace=0.4,
+        height_ratios=[len(union) / 12 + 1, 1])
+
+    # ── Panel A: heatmap of normalised combined importance ─────────────────
+    ax_hm = fig.add_subplot(gs[0, :])
+    hm = cmp_df.loc[union, combined_cols].copy()
+    hm.columns = [c.replace("_combined", "") for c in hm.columns]
+    # Per-column normalisation: each model's max = 1.0 so columns are comparable
+    hm_norm = hm.div(hm.max(axis=0).replace(0, np.nan), axis=1)
+    im = ax_hm.imshow(hm_norm.values, aspect="auto", cmap="viridis")
+    ax_hm.set_yticks(range(len(union)))
+    ax_hm.set_yticklabels(union, fontsize=8)
+    ax_hm.set_xticks(range(len(hm.columns)))
+    ax_hm.set_xticklabels(hm.columns, fontsize=9, rotation=20, ha="right")
+    ax_hm.set_title(
+        f"Normalised Combined Importance  (per-column max = 1)\n"
+        f"Union of top-{top_n} features across models — sorted by global rank",
+        fontsize=10)
+    cbar = fig.colorbar(im, ax=ax_hm, fraction=0.02, pad=0.01)
+    cbar.set_label("rel. importance", fontsize=8)
+    for i, feat in enumerate(union):
+        for j, col in enumerate(hm.columns):
+            v = hm_norm.iloc[i, j]
+            if pd.notna(v):
+                ax_hm.text(j, i, f"{v:.2f}", ha="center", va="center",
+                           fontsize=6.5,
+                           color="white" if v < 0.5 else "black")
+
+    # ── Panel B: scatter expert vs global for each expert ───────────────────
+    expert_names = [m for m in models if m != "global"]
+    for k, name in enumerate(expert_names):
+        ax = fig.add_subplot(gs[1, k])
+        x = cmp_df["global_combined"]
+        y = cmp_df[f"{name}_combined"]
+        mask = x.notna() & y.notna()
+        ax.scatter(x[mask], y[mask], s=18, alpha=0.6, c="#1565C0")
+        # 45° reference
+        if mask.any():
+            lim = max(x[mask].max(), y[mask].max())
+            ax.plot([0, lim], [0, lim], "k--", lw=0.7, alpha=0.5)
+        # Label biggest deviations
+        dev = (y - x).abs().fillna(0)
+        for feat in dev.nlargest(6).index:
+            ax.text(x[feat], y[feat], feat, fontsize=6.5,
+                    path_effects=[pe.withStroke(linewidth=1.5,
+                                                foreground="white")])
+        ax.set_xlabel("global combined", fontsize=8)
+        ax.set_ylabel(f"{name} combined", fontsize=8)
+        ax.set_title(f"{name} vs global", fontsize=9)
+
+    fig.suptitle("EBM Importance — Global vs Experts",
+                 fontsize=13, fontweight="bold", y=0.995)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Comparison plot saved → {out_path}")
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -300,6 +501,14 @@ def main():
                     help="Run ID (sub-folder under ./reports/strategies/)")
     ap.add_argument("--top_n", type=int, default=15,
                     help="Number of top/bottom features to show in bars and console")
+    ap.add_argument("--compare_experts", action="store_true",
+                    help="When MoE/HO-MoE expert importance CSVs exist in the "
+                         "run dir, additionally produce a feature × {global, "
+                         "expert_*} comparison table and plot identifying "
+                         "pattern differences (rank-shift, dispersion).")
+    ap.add_argument("--no_global", action="store_true",
+                    help="Skip the standalone global-model analysis. Only "
+                         "useful with --compare_experts.")
     args = ap.parse_args()
 
     run_dir = f"./reports/strategies/{args.run_id}"
@@ -313,17 +522,36 @@ def main():
     print(f"  Main-effect terms : {n_main}")
     print(f"  Interaction terms : {n_interactions}")
 
-    result, _, _ = parse_importances(imp_df)
-    result = classify_quadrants(result)
+    if not args.no_global:
+        result, _, _ = parse_importances(imp_df)
+        result = classify_quadrants(result)
 
-    print_report(result, args.top_n)
+        print_report(result, args.top_n)
 
-    csv_path = os.path.join(run_dir, "ebm_importance_analysis.csv")
-    result.to_csv(csv_path)
-    print(f"\n  Full table saved → {csv_path}")
+        csv_path = os.path.join(run_dir, "ebm_importance_analysis.csv")
+        result.to_csv(csv_path)
+        print(f"\n  Full table saved → {csv_path}")
 
-    plot_path = os.path.join(run_dir, "ebm_importance_analysis.png")
-    plot_analysis(result, args.top_n, plot_path)
+        plot_path = os.path.join(run_dir, "ebm_importance_analysis.png")
+        plot_analysis(result, args.top_n, plot_path)
+
+    if args.compare_experts:
+        experts = discover_experts(run_dir)
+        if not experts:
+            print(f"\n  [compare_experts] No expert importance files found "
+                  f"in {run_dir} — nothing to compare.")
+        else:
+            print(f"\n  [compare_experts] Found {len(experts)} experts: "
+                  f"{sorted(experts.keys())}")
+            cmp_df, per_model = build_comparison(run_dir)
+            print_compare_report(cmp_df, per_model, args.top_n)
+
+            cmp_csv = os.path.join(run_dir, "ebm_importance_compare.csv")
+            cmp_df.to_csv(cmp_csv)
+            print(f"\n  Comparison table saved → {cmp_csv}")
+
+            cmp_png = os.path.join(run_dir, "ebm_importance_compare.png")
+            plot_compare(cmp_df, per_model, args.top_n, cmp_png)
 
 
 if __name__ == "__main__":

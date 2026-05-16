@@ -1,4 +1,4 @@
-from ..backtest.engine import run_vectorized_backtest
+from ..backtest.engine import run_vectorized_backtest, trim_backtest_result
 from ..strategy.liquidation_reversal import LiquidationReversalStrategy
 from ..data.universe import load_validated_universe
 from ..data.rolling_universe import RollingUniverse, build_symbol_active_mask
@@ -69,6 +69,14 @@ def main():
         "--no_rolling_universe", action="store_true",
         help="Force fixed universe from config (bypasses rolling universe). "
              "Use this to baseline-test strategy correctness.")
+    parser.add_argument(
+        "--perf_start_date", default=None,
+        help="Optional. Trim performance reporting to start from this date "
+             "(YYYY-MM-DD). The saved weights parquet still covers the full "
+             "--start_date / --end_date range so downstream consumers (EBM "
+             "factor panel) get full warmup. Only equity curve, Sharpe, "
+             "summary metrics, score-history factor analysis, and plots are "
+             "computed over the trimmed range.")
     args = parser.parse_args()
     cfg = load_config(args.config)
 
@@ -233,9 +241,9 @@ def main():
     # --- Strategy Execution ---
     strategy = LiquidationReversalStrategy(
         leverage_scale=1.0,
-        oi_level_lookback=30,
-        sentiment_ma_window=30,
-        ts_lookback=30,
+        oi_level_lookback=90,
+        sentiment_ma_window=90,
+        ts_lookback=90,
         half_life_decay=3
     )
 
@@ -244,6 +252,13 @@ def main():
         res = run_vectorized_backtest(
             all_data, strategy, cfg, run_id=args.run_id, file_name='reversal',
             epoch_mask_df=epoch_mask_df)
+
+        # Trim reporting window if requested. Weights parquet is already saved
+        # with the full date range inside run_vectorized_backtest.
+        if args.perf_start_date:
+            print(f"\n[perf_start_date={args.perf_start_date}] "
+                  f"trimming reporting; full weights parquet preserved on disk.")
+            res = trim_backtest_result(res, args.perf_start_date)
 
         print("\n" + "="*40)
         print("           BACKTEST RESULTS           ")

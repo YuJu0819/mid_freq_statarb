@@ -11,7 +11,7 @@ from ..scripts.get_top_futures_symbols import get_top_futures_symbols
 
 # --- Configuration ---
 # Update this range to cover your full backtest period
-START_DATE = date(2024, 1, 1)
+START_DATE = date(2023, 1, 1)
 END_DATE = date(2025, 11, 20)
 OUTPUT_DIRECTORY = "./data/open_interest"
 DAILY_BASE_URL = "https://data.binance.vision/data/futures/um/daily/metrics"

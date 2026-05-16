@@ -72,7 +72,7 @@ def normalize_features(
             else:  # rank
                 wide = wide.rank(axis=1, pct=True)
 
-            long = wide.stack(dropna=False).rename(col).reset_index()
+            long = wide.stack(future_stack=True).rename(col).reset_index()
             panel = panel.drop(columns=[col]).merge(
                 long, on=["ts", "symbol"], how="left")
 
@@ -85,7 +85,7 @@ def normalize_features(
             sd = wide.rolling(
                 ts_z_window, min_periods=ts_z_window // 4).std().replace(0, np.nan)
             wide = (wide - mu) / sd
-            long = wide.stack(dropna=False).rename(col).reset_index()
+            long = wide.stack(future_stack=True).rename(col).reset_index()
             panel = panel.drop(columns=[col]).merge(
                 long, on=["ts", "symbol"], how="left")
 
@@ -173,7 +173,7 @@ def neutralize_features_on_adx(
         residual  = wide.subtract(
             slope.multiply(adx_series, axis=0)).subtract(intercept)
 
-        long = residual.stack(dropna=False).rename(col).reset_index()
+        long = residual.stack(future_stack=True).rename(col).reset_index()
         panel = panel.drop(columns=[col]).merge(long, on=["ts", "symbol"], how="left")
         neutralized += 1
 
@@ -216,7 +216,7 @@ def build_target(
     fwd_raw = wide.shift(-horizon)
 
     # y_raw: plain decimal forward return for PnL, never neutralized
-    long_raw = fwd_raw.stack(dropna=False).rename("y_raw").reset_index()
+    long_raw = fwd_raw.stack(future_stack=True).rename("y_raw").reset_index()
     panel = panel.merge(long_raw, on=["ts", "symbol"], how="left")
 
     # fwd_for_target: optionally beta-neutral version used for training
@@ -249,7 +249,7 @@ def build_target(
     else:
         fwd = fwd_for_target
 
-    long = fwd.stack(dropna=False).rename("y").reset_index()
+    long = fwd.stack(future_stack=True).rename("y").reset_index()
     panel = panel.merge(long, on=["ts", "symbol"], how="left")
     return panel
 

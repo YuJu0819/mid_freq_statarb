@@ -70,13 +70,20 @@ from ..alpha.ml_utils import (
     compute_portfolio_performance,
     compute_ic,
 )
+from ..alpha.ho_moe import (
+    MACRO_CANDIDATES,
+    compute_macro_candidates,
+    discover_regime_separator_cmi,
+    fit_macro_regime_bin_edges,
+    apply_macro_regime_bin_edges,
+)
 
 import argparse
 import os
 import pickle
 import warnings
 
-from joblib import parallel_backend
+from joblib import Parallel, delayed
 
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
@@ -118,13 +125,19 @@ _TARGET_COLS = {"ret_1d", "ret_5d", "ret_20d"}
 DEFAULT_FEATURES = [
     # price
     "ret_1d", "ret_5d", "ret_20d",
-    "volatility_30", "vol_rank_cs", "beta_60", "skewness_90",
+    "volatility_30", "vol_rank_cs", "beta_60", "skewness_45",
+    # liquidity (NEW)
+    "liquidity_log", "liquidity_rank_cs",
     # momentum
-    "price_roc", "oi_roc", "basis_norm", "basis_mom",
+    "price_roc", "oi_roc",
+    "basis_norm", "basis_norm_smooth3",  # raw + 3d-smoothed companion
+    "basis_mom",
     "vol_ratio_sig", "trend_score", "sentiment_score", "combined_score",
     "funding_z", "funding_penalty", "mom_final_score",
     # reversal
-    "ls_ratio", "ls_chg_1d", "oi_pct_chg_1d",
+    "ls_ratio",
+    "ls_chg_1d", "ls_chg_smooth3",          # raw + 3d-smoothed companion
+    "oi_pct_chg_1d", "oi_pct_chg_smooth3",  # raw + 3d-smoothed companion
     "cs_z_oi_chg", "ts_z_oi_chg", "liquidation_shock",
     "regime_score", "interaction_alpha", "reversal_hawkes", "rev_final_score",
     # market regime — numeric-encoded
@@ -133,17 +146,19 @@ DEFAULT_FEATURES = [
     "trend_regime_enc",
     "skew_regime_enc",
     # delta family (rolling-5 mean minus lag-10 of itself)
-    # Only factors with lookback <= 30d; long-window factors (beta_60, skewness_90,
+    # Only factors with lookback <= 30d; long-window factors (beta_60, skewness_45,
     # funding_z, liquidation_shock, regime_score, interaction_alpha) are excluded
-    # because a 10-day delta on a 40-180d stat is near-constant and uninformative.
+    # because a 10-day delta on a 45-180d stat is near-constant and uninformative.
     "volatility_30_delta", "vol_rank_cs_delta",
     "price_roc_delta", "oi_roc_delta", "basis_norm_delta", "basis_mom_delta",
     "vol_ratio_sig_delta", "trend_score_delta", "sentiment_score_delta",
     "combined_score_delta", "mom_final_score_delta",
     "ls_ratio_delta", "rev_final_score_delta",
+    "liquidity_rank_cs_delta",
 ]
-_FILTERED_COLS: set = set()   # populate to enable --features filtered
-
+_FILTERED_COLS = {
+    'ls_chg_smooth3', 'oi_pct_chg_smooth3', 'basis_norm_smooth3', 'market_volatility', 'cs_z_oi_chg'
+}
 
 # ---------------------------------------------------------------------------
 # EBM walk-forward training
@@ -221,22 +236,36 @@ def _embargo_gap(n_train_dates: int, target_horizon: int, embargo_pct: float) ->
     return max(target_horizon, int(n_train_dates * embargo_pct))
 
 
-def _block_bootstrap_indices(
-    n: int, block_size: int, rng: np.random.Generator
+def _block_bootstrap_counts(
+    n_dates: int, block_size: int, n_blocks: int,
+    rng: np.random.Generator,
 ) -> np.ndarray:
     """
-    Block bootstrap: sample consecutive blocks of row indices with replacement.
-    Preserves local temporal autocorrelation so each bag reflects realistic
-    time-series behaviour. Returns sorted unique indices (size ≈ n).
+    Block bootstrap with REPLACEMENT — returns per-date counts.
+
+    Samples `n_blocks` consecutive blocks of length `block_size` from
+    [0, n_dates), with replacement. A given date can appear in multiple
+    blocks; this function tallies how many blocks cover each date and
+    returns the count vector (length n_dates, dtype int16).
+
+    This is the canonical block bootstrap: duplicates ARE preserved, so
+    each bag's effective sample size equals `n_dates` (with repeats),
+    and the out-of-bag fraction follows the standard 1 − 1/e ≈ 37% law,
+    giving real variance reduction on averaging. Returning unique indices
+    (the previous behaviour) collapsed each bag back toward the full
+    training set and killed the variance-reduction benefit.
+
+    All sampling is strictly within [0, n_dates) — no peeking forward.
     """
-    if block_size <= 0 or n <= block_size:
-        return np.arange(n)
-    n_blocks = max(1, n // block_size)
-    max_start = n - block_size
+    if block_size <= 0 or n_dates <= block_size:
+        return np.ones(n_dates, dtype=np.int16)
+    counts = np.zeros(n_dates, dtype=np.int16)
+    max_start = n_dates - block_size
     starts = rng.integers(0, max_start + 1, size=n_blocks)
-    idx = np.concatenate([np.arange(s, min(s + block_size, n))
-                         for s in starts])
-    return np.unique(idx)
+    for s in starts:
+        end = min(s + block_size, n_dates)
+        counts[s:end] += 1
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -338,77 +367,12 @@ class RegimeSelector:
         return self._raw_map.get(ts)
 
 
-class ResidualMoE:
-    """
-    Residual-Based Mixture of Experts ensemble.
-
-    Holds one global EBM ensemble (trained on the full window target) and a
-    per-regime expert EBM ensemble (trained on global residuals).
-
-    Prediction
-    ----------
-    Score_total = Global_Score + (λ × Expert_Score)
-
-    When the active regime has no trained expert the expert contribution
-    falls back to zero, so the total score equals the global score.
-    """
-
-    def __init__(
-        self,
-        global_models: list,
-        # str(regime) -> list[ExplainableBoostingRegressor]
-        expert_dict: dict,
-    ):
-        self.global_models = global_models
-        self.expert_dict = expert_dict
-
-    # ------------------------------------------------------------------
-    def predict_global(self, X: np.ndarray) -> np.ndarray:
-        return np.mean([m.predict(X) for m in self.global_models], axis=0)
-
-    def predict_expert(
-        self,
-        regime: str | None,
-        X: np.ndarray,
-        X_expert: "np.ndarray | None" = None,
-    ) -> np.ndarray:
-        if regime is None or regime not in self.expert_dict:
-            return np.zeros(len(X))
-        experts = self.expert_dict[regime]
-        if not experts:
-            return np.zeros(len(X))
-        # If ADX-neutralized features are provided for experts, use them;
-        # otherwise fall back to the same X as the global model.
-        X_in = X_expert if X_expert is not None else X
-        return np.mean([m.predict(X_in) for m in experts], axis=0)
-
-    def predict_total(
-        self,
-        X: np.ndarray,
-        regime: str | None,
-        moe_boost_lambda: float,
-        X_expert: "np.ndarray | None" = None,
-    ) -> np.ndarray:
-        g = self.predict_global(X)
-        e = self.predict_expert(regime, X, X_expert=X_expert)
-        return g + moe_boost_lambda * e
-
-    # ------------------------------------------------------------------
-    def global_importances(self) -> pd.Series:
-        imp = [
-            pd.Series(m.term_importances(), index=list(m.term_names_))
-            for m in self.global_models
-        ]
-        return pd.concat(imp, axis=1).mean(axis=1)
-
-    def expert_importances(self, regime: str) -> pd.Series | None:
-        if regime not in self.expert_dict or not self.expert_dict[regime]:
-            return None
-        imp = [
-            pd.Series(m.term_importances(), index=list(m.term_names_))
-            for m in self.expert_dict[regime]
-        ]
-        return pd.concat(imp, axis=1).mean(axis=1)
+# ResidualMoE lives in src.alpha.residual_moe so loky workers can pickle
+# instances of it. When the class was defined here, running this file via
+# `python -m src.scripts.train_ebm_signal` registered it under __main__,
+# and worker processes (which re-import the module under its real path)
+# couldn't resolve __main__.ResidualMoE → PicklingError.
+from ..alpha.residual_moe import ResidualMoE  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +399,7 @@ def walk_forward(
     n_outer_bags: int = 8,
     block_size: int = 21,
     embargo_pct: float = 0.01,
+    bag_symbol_frac: float = 1.0,
     # ── MoE ────────────────────────────────────────────────────────────
     use_moe: bool = False,
     regime_col: str = "volatility_regime_enc",
@@ -443,6 +408,7 @@ def walk_forward(
     expert_ebm_kwargs: dict | None = None,
     regime_selector: "RegimeSelector | None" = None,
     expert_panel: "pd.DataFrame | None" = None,
+    pred_start_date: "pd.Timestamp | None" = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, dict | None]:
     """
     Walk-forward EBM training.
@@ -474,19 +440,33 @@ def walk_forward(
     n_dates = len(dates)
     label_cutoff_idx = n_dates - target_horizon
 
+    # Effective prediction-start index. If pred_start_date is provided,
+    # predictions begin at the first panel date >= pred_start_date.
+    # Pre-pred_start dates are still kept in the panel as warmup history
+    # for training, EWM features, and rolling lookbacks.
+    pred_start_idx = min_train_periods
+    if pred_start_date is not None:
+        ps = pd.Timestamp(pred_start_date)
+        candidates = [i for i, d in enumerate(dates) if pd.Timestamp(d) >= ps]
+        if candidates:
+            pred_start_idx = max(min_train_periods, candidates[0])
+
     all_preds: dict = {}
     all_importances: list = []
     all_fold_stats: list = []
     all_expert_importances: dict = {}  # regime_str -> list[pd.Series]
     is_daily_rets: dict = {}
 
+    # Retrain schedule anchored to pred_start_idx so the first OOS prediction
+    # date triggers an immediate retrain.
     retrain_set = {
-        i for i in range(min_train_periods, label_cutoff_idx)
-        if (i - min_train_periods) % retrain_freq == 0
+        i for i in range(pred_start_idx, label_cutoff_idx)
+        if (i - pred_start_idx) % retrain_freq == 0
     }
 
     print(f"  Dates total: {n_dates}  |  "
-          f"Prediction dates: {label_cutoff_idx - min_train_periods}  |  "
+          f"Prediction dates: {label_cutoff_idx - pred_start_idx}  |  "
+          f"First pred = {dates[pred_start_idx] if pred_start_idx < n_dates else 'N/A'}  |  "
           f"Retraining {len(retrain_set)} times (every {retrain_freq} periods)")
     if use_block_bagging:
         print(f"  Block bagging ON: {n_outer_bags} bags  "
@@ -513,8 +493,10 @@ def walk_forward(
             regime_selector = _internal_regime_selector
             eff_lambda = moe_boost_lambda
             eff_expert_kwargs = expert_ebm_kwargs or ebm_kwargs
+            n_expert_jobs = max(1, os.cpu_count() or 1)
             print(f"  MoE ON: regime_col={regime_col}  "
-                  f"λ={eff_lambda}  hysteresis={moe_hysteresis}")
+                  f"λ={eff_lambda}  hysteresis={moe_hysteresis}  "
+                  f"expert_parallel_jobs={n_expert_jobs}")
 
     # sentinel: list (standard) or ResidualMoE (moe); None = not yet trained
     models: list | ResidualMoE | None = None
@@ -536,21 +518,34 @@ def walk_forward(
     def _make_temporal_bags(
         n: int, n_bags: int, use_blocks: bool,
         date_arr: np.ndarray | None = None,
+        symbol_arr: np.ndarray | None = None,
+        symbol_frac: float = 1.0,
     ) -> np.ndarray:
         """Build a (n_samples × n_bags) bags matrix with temporal validation.
 
-        When use_blocks=True and date_arr is provided, blocks are sampled in
-        DATE units (block_size consecutive trading days) then expanded to all
-        row indices belonging to those dates.  This ensures each block covers
-        a meaningful temporal window regardless of universe size.
+        Returns an int16 matrix where each entry is:
+          k > 0 : row is in this bag's training set, sampled k times
+                  (block-bootstrap-with-replacement count for the row's date,
+                  zero-ed if the row's symbol is not in the bag's symbol subset)
+          -1    : row is in this bag's validation holdout (last val_dates,
+                  identical across bags for early-stopping consistency)
+           0    : row is excluded from this bag
 
-        When use_blocks=False (non-block-bagging path), all training-pool rows
-        are set to +1 for every bag and the tail is set to -1 for validation.
+        Diversity sources (all leak-free — sampling never touches the
+        validation tail or any post-pred-date data):
 
-        bags matrix values:
-          +1  training for this bag
-          -1  validation for this bag (temporal holdout)
-           0  excluded from this bag
+          1. TIME diversity — block bootstrap WITH duplicates: each bag
+             samples ~train_dates / block_size blocks of consecutive dates,
+             with replacement. Counts > 1 are real (the canonical bootstrap
+             effect), giving each bag ~63% unique training dates.
+          2. CROSS-SECTIONAL diversity — when symbol_frac < 1.0, each bag
+             keeps a random subset of symbols (without replacement). Other
+             symbols are zeroed out for that bag. Bag-to-bag the symbol
+             subsets differ, so each bag's CS panel is decorrelated.
+
+        Validation rows are NEVER touched by either sampler — they remain
+        -1 across all bags, and date sampling is restricted to the
+        [0, train_date_cutoff) range.
         """
         if use_blocks and date_arr is not None:
             unique_dates = np.unique(date_arr)
@@ -558,24 +553,58 @@ def walk_forward(
             date_to_idx = {d: i for i, d in enumerate(unique_dates)}
             row_date_idx = np.array([date_to_idx[d] for d in date_arr])
 
-            # val: last val_dates trading days reserved for early-stopping validation
-            val_dates = min(max(target_horizon, block_size),
-                            int(n_dates * 0.1))
-            # date indices [0, cutoff) = train
+            # Validation: last 20% of training dates (early-stopping holdout)
+            val_dates = int(n_dates * 0.2)
             train_date_cutoff = n_dates - val_dates
-
             train_row_mask = row_date_idx < train_date_cutoff
 
-            mat = np.zeros((n, n_bags), dtype=np.int8)
-            mat[~train_row_mask, :] = -1  # validation rows fixed for all bags
+            # Per-bag block count: aim for ~1× coverage of training dates,
+            # producing canonical bootstrap behaviour (~63% unique).
+            n_blocks_per_bag = max(
+                1, int(np.ceil(train_date_cutoff / block_size)))
+
+            # CS subsample setup
+            do_sym_sub = (symbol_arr is not None) and (symbol_frac < 1.0)
+            if do_sym_sub:
+                unique_syms = np.unique(symbol_arr)
+                n_syms = len(unique_syms)
+                sym_to_idx = {s: i for i, s in enumerate(unique_syms)}
+                row_sym_idx = np.array([sym_to_idx[s] for s in symbol_arr])
+                keep_size = max(1, int(n_syms * symbol_frac))
+
+            mat = np.zeros((n, n_bags), dtype=np.int16)
+            mat[~train_row_mask, :] = -1  # validation rows pinned across bags
 
             for b in range(n_bags):
-                # Block bootstrap on DATE indices, then expand to rows
-                sel_date_idx = _block_bootstrap_indices(
-                    train_date_cutoff, block_size, rng)  # date dimension
-                sel_row_mask = np.isin(
-                    row_date_idx, sel_date_idx) & train_row_mask
-                mat[sel_row_mask, b] = 1
+                # 1) TIME: sample blocks with replacement → per-date counts.
+                #    Strictly within [0, train_date_cutoff) — no future leak.
+                #    Pad to full date length so indexing by row_date_idx is
+                #    safe for validation rows (their counts are zero anyway).
+                tr_counts = _block_bootstrap_counts(
+                    train_date_cutoff, block_size, n_blocks_per_bag, rng)
+                date_counts = np.zeros(n_dates, dtype=np.int16)
+                date_counts[:train_date_cutoff] = tr_counts
+                row_counts = date_counts[row_date_idx]  # safe broadcast
+
+                # 2) CS: optional per-bag symbol subsample
+                if do_sym_sub:
+                    keep_idx = rng.choice(
+                        n_syms, size=keep_size, replace=False)
+                    sym_keep_mask = np.zeros(n_syms, dtype=bool)
+                    sym_keep_mask[keep_idx] = True
+                    sym_active = sym_keep_mask[row_sym_idx]
+                else:
+                    sym_active = np.ones(n, dtype=bool)
+
+                # 3) Combine: training rows that are in selected dates AND
+                #    selected symbols receive their date count; others 0.
+                bag_col = np.where(
+                    train_row_mask & sym_active & (row_counts > 0),
+                    row_counts, 0,
+                ).astype(np.int16)
+                # Restore validation pin for this column (always -1)
+                bag_col[~train_row_mask] = -1
+                mat[:, b] = bag_col
             return mat
         else:
 
@@ -584,8 +613,9 @@ def walk_forward(
                 n_dates = len(unique_dates)
                 date_to_idx = {d: i for i, d in enumerate(unique_dates)}
                 row_date_idx = np.array([date_to_idx[d] for d in date_arr])
-                val_dates = min(max(target_horizon, block_size),
-                                int(n_dates * 0.1))
+                # val_dates = min(max(target_horizon, block_size),
+                #                 int(n_dates * 0.2))
+                val_dates = int(n_dates * 0.2)
                 train_date_cutoff = n_dates - val_dates
                 train_row_mask = row_date_idx < train_date_cutoff
                 # breakpoint()
@@ -607,13 +637,15 @@ def walk_forward(
     def _train_ebm_ensemble(
         X: np.ndarray, y: np.ndarray, kwargs: dict,
         date_arr: np.ndarray | None = None,
+        symbol_arr: np.ndarray | None = None,
         force_no_bagging: bool = False,
     ) -> list:
         """Train a single or block-bagged EBM ensemble. Returns list of models.
 
-        Block-bagging uses a manual bags matrix with date-aware temporal
-        validation: blocks are block_size consecutive trading days, and the
-        validation holdout is the last val_dates × all-symbol rows.
+        Block-bagging uses a manual bags matrix with two leak-free diversity
+        sources: (1) block bootstrap WITH replacement on training-window dates
+        (per-date counts, ~63% unique → real variance reduction), and (2)
+        per-bag symbol subsampling when bag_symbol_frac < 1.0.
 
         Non-block-bagging (or force_no_bagging=True) fits a plain EBM on the
         full training set.  Expert models pass force_no_bagging=True because
@@ -623,11 +655,13 @@ def walk_forward(
         n = len(X)
         if use_block_bagging and not force_no_bagging:
             bags_matrix = _make_temporal_bags(
-                n, n_outer_bags, use_blocks=True, date_arr=date_arr)
+                n, n_outer_bags, use_blocks=True,
+                date_arr=date_arr, symbol_arr=symbol_arr,
+                symbol_frac=bag_symbol_frac,
+            )
             kwargs_bag = {**kwargs, "outer_bags": n_outer_bags}
             m = ExplainableBoostingRegressor(**kwargs_bag)
-            with parallel_backend("sequential"):
-                m.fit(X, y, bags=bags_matrix)
+            m.fit(X, y, bags=bags_matrix)
             return [m]
         else:
             n_bags = kwargs.get("outer_bags", 8)
@@ -635,8 +669,7 @@ def walk_forward(
                 n, n_bags, use_blocks=False, date_arr=date_arr)
             kwargs_fixed = {**kwargs, "outer_bags": n_bags}
             m = ExplainableBoostingRegressor(**kwargs_fixed)
-            with parallel_backend("sequential"):
-                m.fit(X, y, bags=bags_matrix)
+            m.fit(X, y, bags=bags_matrix)
             return [m]
 
     def _ensemble_importances(model_list: list) -> pd.Series:
@@ -647,7 +680,7 @@ def walk_forward(
         ]
         return pd.concat(imp, axis=1).mean(axis=1)
 
-    for pred_idx in range(min_train_periods, label_cutoff_idx):
+    for pred_idx in range(pred_start_idx, label_cutoff_idx):
         pred_date = dates[pred_idx]
 
         # ── Retrain if needed ────────────────────────────────────────────────
@@ -704,7 +737,8 @@ def walk_forward(
                 # Stage 1: Global EBM on original features
                 global_models = _train_ebm_ensemble(
                     X_train, y_train, ebm_kwargs,
-                    date_arr=train_data["ts"].values)
+                    date_arr=train_data["ts"].values,
+                    symbol_arr=train_data["symbol"].values)
                 y_global_pred = np.mean(
                     [m.predict(X_train) for m in global_models], axis=0)
 
@@ -719,23 +753,49 @@ def walk_forward(
                     lambda v: str(int(v)) if pd.notna(v) else "nan"
                 ).values
 
-                expert_models_dict: dict = {}
+                # Build list of regime training tasks (skip nan / too-small)
+                regime_tasks = []
                 for regime_str in np.unique(train_regime_raw):
                     if regime_str == "nan":
                         continue
                     mask = train_regime_raw == regime_str
                     if mask.sum() < 30:
+                        breakpoint()
                         continue
-                    X_reg = X_for_experts[mask]
-                    y_reg = y_residuals[mask]
+                    regime_tasks.append((
+                        regime_str, mask,
+                        X_for_experts[mask],
+                        y_residuals[mask],
+                        train_data["ts"].values[mask],
+                    ))
 
-                    expert_models = _train_ebm_ensemble(
+                def _fit_one_expert(X_reg, y_reg, date_arr_reg):
+                    return _train_ebm_ensemble(
                         X_reg, y_reg, eff_expert_kwargs,
-                        date_arr=train_data["ts"].values[mask],
-                        force_no_bagging=True)
+                        date_arr=date_arr_reg, force_no_bagging=True)
 
+                # Train expert EBMs in parallel across regimes.
+                # Use threading backend so we avoid nested loky workers when
+                # this function itself is being run inside a loky worker
+                # (per-epoch parallelism). Skip the Parallel call entirely if
+                # there are no eligible regimes for this fold.
+                if regime_tasks:
+                    n_inner_jobs = max(
+                        1, min(len(regime_tasks), n_expert_jobs))
+                    expert_results = Parallel(
+                        n_jobs=n_inner_jobs,
+                        backend="threading",
+                    )(
+                        delayed(_fit_one_expert)(X_r, y_r, d_r)
+                        for _, _, X_r, y_r, d_r in regime_tasks
+                    )
+                else:
+                    expert_results = []
+
+                expert_models_dict: dict = {}
+                for (regime_str, _mask, *_), expert_models in zip(
+                        regime_tasks, expert_results):
                     expert_models_dict[regime_str] = expert_models
-                    # Collect expert importances for this fold
                     imp_e = _ensemble_importances(expert_models)
                     imp_e.name = str(pred_date.date())
                     all_expert_importances.setdefault(
@@ -770,7 +830,8 @@ def walk_forward(
             else:
                 models = _train_ebm_ensemble(
                     X_train, y_train, ebm_kwargs,
-                    date_arr=train_data["ts"].values)
+                    date_arr=train_data["ts"].values,
+                    symbol_arr=train_data["symbol"].values)
                 y_pred_is = _predict_ensemble(X_train)
 
                 imp_avg = _ensemble_importances(models)
@@ -865,6 +926,475 @@ def walk_forward(
 
 
 # ---------------------------------------------------------------------------
+# HO-MoE walk-forward (CMI tournament + TS neutralization + market-wide MoE)
+# ---------------------------------------------------------------------------
+
+
+def walk_forward_ho_moe(
+    panel: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    target_horizon: int,
+    target_type: str,
+    train_window: int,
+    retrain_freq: int,
+    min_train_periods: int,
+    quantile: float,
+    ebm_kwargs: dict,
+    expert_ebm_kwargs: dict,
+    save_models: bool,
+    model_dir: str,
+    beta_neutral: bool = False,
+    beta_col: str = "beta_60",
+    use_block_bagging: bool = False,
+    n_outer_bags: int = 8,
+    block_size: int = 21,
+    embargo_pct: float = 0.01,
+    # HO-MoE specifics
+    moe_boost_lambda: float = 0.5,
+    moe_hysteresis: int = 3,
+    cmi_candidates: tuple = MACRO_CANDIDATES,
+    cmi_ema_span: int = 3,
+    cmi_q_target: int = 3,
+    cmi_q_features: int = 5,
+    cmi_q_candidates: int = 3,
+    ts_neutral_window: int = 30,
+    ts_neutralize: bool = True,
+    n_regimes: int = 3,
+    fix_separator: str | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, dict | None, pd.DataFrame, pd.DataFrame]:
+    """
+    Walk-forward EBM with the HO-MoE pipeline:
+
+      * Pass 1 (every retrain) — CMI tournament across `cmi_candidates`
+        on the trailing IS panel. EMA(span=cmi_ema_span) smooths per-candidate
+        Average_CMI scores; the highest-scoring candidate wins and becomes
+        the active Regime_Separator.
+
+      * Pass 2 (every retrain) — when the winner changes, the panel is
+        TS-neutralized against the new winner (per-symbol rolling OLS via
+        `neutralize_features_on_adx`) and the macro regime label is re-
+        derived from IS-fit time-series quantile edges.  A market-wide
+        `RegimeSelector` (with hysteresis) gates expert selection at OOS.
+
+      * Training — Global EBM on the TS-neutralized features predicts raw
+        returns; per-regime Expert EBMs are trained on the raw normalized
+        features against the global model's residuals.
+
+    Returns the same five outputs as `walk_forward` plus a sixth — the
+    per-fold CMI tournament log.
+    """
+    panel = panel.copy()
+    missing = [c for c in cmi_candidates if c not in panel.columns]
+    if missing:
+        raise ValueError(
+            f"walk_forward_ho_moe: macro candidate column(s) missing from "
+            f"panel: {missing}. Run compute_macro_candidates() upstream.")
+
+    dates = sorted(panel["ts"].unique())
+    n_dates = len(dates)
+    label_cutoff_idx = n_dates - target_horizon
+
+    all_preds: dict = {}
+    all_importances: list = []
+    all_fold_stats: list = []
+    all_expert_importances: dict = {}
+    is_daily_rets: dict = {}
+    cmi_log_rows: list = []
+    regime_timeline_rows: list = []  # one row per OOS pred_date
+
+    retrain_set = {
+        i for i in range(min_train_periods, label_cutoff_idx)
+        if (i - min_train_periods) % retrain_freq == 0
+    }
+
+    print(f"  Dates total: {n_dates}  |  "
+          f"Prediction dates: {label_cutoff_idx - min_train_periods}  |  "
+          f"Retraining {len(retrain_set)} times (every {retrain_freq} periods)")
+    if fix_separator is not None:
+        print(f"  HO-MoE: FIXED separator={fix_separator!r}  "
+              f"(CMI tournament skipped)  "
+              f"ts_neutralize={ts_neutralize}"
+              + (f"  ts_neutral_window={ts_neutral_window}" if ts_neutralize else "")
+              + f"  regimes={n_regimes}  λ={moe_boost_lambda}  "
+              f"hysteresis={moe_hysteresis}")
+    else:
+        print(f"  HO-MoE: candidates={list(cmi_candidates)}  "
+              f"ema_span={cmi_ema_span}  "
+              f"ts_neutralize={ts_neutralize}"
+              + (f"  ts_neutral_window={ts_neutral_window}" if ts_neutralize else "")
+              + f"  regimes={n_regimes}  λ={moe_boost_lambda}  "
+              f"hysteresis={moe_hysteresis}")
+
+    # ── State ────────────────────────────────────────────────────────────
+    ema_history: dict = {}
+    current_winner: str | None = None
+    panel_neutral: pd.DataFrame | None = None
+    regime_selector: RegimeSelector | None = None
+    models: ResidualMoE | None = None
+    rng = np.random.default_rng(ebm_kwargs.get("random_state", 42))
+    n_expert_jobs = max(1, os.cpu_count() or 1)
+    LABEL_COL = "_ho_moe_regime_enc"
+
+    def _fill_features(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        for col in feature_cols:
+            if col in df.columns:
+                df[col] = df[col].fillna(0.0)
+        return df
+
+    def _make_temporal_bags(
+        n: int, n_bags: int, use_blocks: bool,
+        date_arr: np.ndarray | None,
+    ) -> np.ndarray:
+        # Same shape as walk_forward's nested helper — date-aware split with
+        # validation tail reserved for early stopping.
+        if date_arr is None:
+            raise ValueError("HO-MoE: date_arr required for temporal bags.")
+        unique_dates = np.unique(date_arr)
+        n_d = len(unique_dates)
+        date_to_idx = {d: i for i, d in enumerate(unique_dates)}
+        row_date_idx = np.array([date_to_idx[d] for d in date_arr])
+        # val_dates = min(max(target_horizon, block_size), int(n_d * 0.1))
+        val_dates = int(n_d * 0.2)
+        train_date_cutoff = n_d - val_dates
+        train_row_mask = row_date_idx < train_date_cutoff
+        mat = np.zeros((n, n_bags), dtype=np.int8)
+        mat[~train_row_mask, :] = -1
+        if use_blocks:
+            for b in range(n_bags):
+                sel_date_idx = np.unique(np.concatenate([
+                    np.arange(s, min(s + block_size, train_date_cutoff))
+                    for s in rng.integers(
+                        0, max(1, train_date_cutoff - block_size + 1),
+                        size=max(1, train_date_cutoff // max(block_size, 1)))
+                ]))
+                sel_row_mask = np.isin(
+                    row_date_idx, sel_date_idx) & train_row_mask
+                mat[sel_row_mask, b] = 1
+        else:
+            mat[train_row_mask, :] = 1
+        return mat
+
+    def _train_ebm_ensemble(
+        X: np.ndarray, y: np.ndarray, kwargs: dict,
+        date_arr: np.ndarray,
+        force_no_bagging: bool = False,
+    ) -> list:
+        n = len(X)
+        n_bags = (n_outer_bags if (use_block_bagging and not force_no_bagging)
+                  else kwargs.get("outer_bags", 8))
+        use_blocks = use_block_bagging and not force_no_bagging
+        bags_matrix = _make_temporal_bags(n, n_bags, use_blocks, date_arr)
+        kw = {**kwargs, "outer_bags": n_bags}
+        m = ExplainableBoostingRegressor(**kw)
+        m.fit(X, y, bags=bags_matrix)
+        return [m]
+
+    def _ensemble_importances(model_list: list) -> pd.Series:
+        imps = [pd.Series(m.term_importances(), index=list(m.term_names_))
+                for m in model_list]
+        return pd.concat(imps, axis=1).mean(axis=1)
+
+    _first_train_logged = False
+
+    for pred_idx in range(min_train_periods, label_cutoff_idx):
+        pred_date = dates[pred_idx]
+
+        # ── Retrain ──────────────────────────────────────────────────────
+        if pred_idx in retrain_set:
+            gap = _embargo_gap(
+                min(pred_idx, train_window if train_window > 0 else pred_idx),
+                target_horizon, embargo_pct,
+            )
+            train_end_idx = max(0, pred_idx - gap)
+            train_start_idx = (
+                max(0, train_end_idx - train_window) if train_window > 0 else 0
+            )
+            train_dates = dates[train_start_idx:train_end_idx]
+            train_data = panel[panel["ts"].isin(train_dates)].copy()
+            train_data = train_data.dropna(subset=["y"])
+            train_data = _fill_features(train_data)
+
+            if len(train_data) < 50:
+                if not _first_train_logged:
+                    print(f"  [warn] pred_idx={pred_idx}: only {len(train_data)} "
+                          f"valid training rows (need 50). Waiting for more data...")
+                continue
+
+            # ── Pass 1: separator selection ─────────────────────────────
+            # When fix_separator is set the CMI tournament is skipped — every
+            # fold uses the same column as Regime_Separator. Useful for A/B
+            # testing individual macro candidates against the legacy static
+            # volatility_regime_enc baseline.
+            if fix_separator is not None:
+                if fix_separator not in train_data.columns:
+                    raise ValueError(
+                        f"fix_separator='{fix_separator}' not in panel columns.")
+                new_winner = fix_separator
+                diag = pd.DataFrame({
+                    "raw_cmi": {c: np.nan for c in cmi_candidates},
+                    "ema_cmi": {c: np.nan for c in cmi_candidates},
+                })
+            else:
+                new_winner, ema_history, diag = discover_regime_separator_cmi(
+                    train_data, feature_cols, ema_history,
+                    target_col="y",  # raw return — built via build_target upstream
+                    candidates=cmi_candidates,
+                    ema_span=cmi_ema_span,
+                    q_target=cmi_q_target,
+                    q_features=cmi_q_features,
+                    q_candidates=cmi_q_candidates,
+                )
+            row = {"fold_date": pred_date, "winner": new_winner}
+            for r in cmi_candidates:
+                row[f"raw_cmi_{r}"] = float(diag["raw_cmi"].get(r, np.nan))
+                row[f"ema_cmi_{r}"] = float(diag["ema_cmi"].get(r, np.nan))
+            cmi_log_rows.append(row)
+
+            # ── Pass 2: neutralize + relabel if winner flipped ─────────
+            if new_winner != current_winner:
+                if not _first_train_logged:
+                    print(f"  [info] First fit at pred_idx={pred_idx} "
+                          f"using {len(train_data)} rows ({len(train_dates)} dates)")
+                print(f"    [HO-MoE] fold {pred_date.date()}  winner → "
+                      f"{new_winner}  "
+                      f"(raw_cmi={diag['raw_cmi'].to_dict()})")
+                current_winner = new_winner
+
+                # TS neutralization on the WHOLE panel against the winner —
+                # the rolling-OLS implementation already respects min_periods
+                # so early dates are gracefully NaN'd.
+                #
+                # When ts_neutralize is False (caller passed --no-adx_neutral)
+                # the Global model trains on the same raw normalized features
+                # as the experts — the global vs expert distinction then comes
+                # purely from "market-wide alpha" vs "regime-conditional alpha"
+                # rather than "regime-stripped" vs "raw" features.
+                if ts_neutralize:
+                    panel_neutral = neutralize_features_on_adx(
+                        panel, feature_cols,
+                        adx_col=current_winner,
+                        window=ts_neutral_window,
+                    )
+                else:
+                    panel_neutral = panel.copy()
+
+                # IS-fit bin edges → apply to whole panel for label parity.
+                edges = fit_macro_regime_bin_edges(
+                    train_data, current_winner, n_quantiles=n_regimes
+                )
+                if edges is None:
+                    panel[LABEL_COL] = float(n_regimes // 2)
+                else:
+                    labelled = apply_macro_regime_bin_edges(
+                        panel, current_winner, edges,
+                        label_col=LABEL_COL,
+                    )
+                    panel[LABEL_COL] = labelled[LABEL_COL].values
+                panel_neutral[LABEL_COL] = panel[LABEL_COL].values
+
+                regime_selector = RegimeSelector(
+                    panel, LABEL_COL, hysteresis=moe_hysteresis,
+                )
+
+            # Pull post-neutralization training rows in the same row order
+            # as `train_data` (rows already filtered to dropna(y) + filled).
+            train_data_neut = (
+                train_data[["ts", "symbol"]]
+                .reset_index(drop=True)
+                .merge(panel_neutral, on=["ts", "symbol"], how="left")
+            )
+            train_data_neut = _fill_features(train_data_neut)
+
+            X_train_neut = train_data_neut[feature_cols].values
+            X_train_raw = train_data[feature_cols].values
+            y_train = train_data["y"].values
+
+            # ── Stage 1: Global EBM on neutralized features ────────────
+            global_models = _train_ebm_ensemble(
+                X_train_neut, y_train, ebm_kwargs,
+                date_arr=train_data["ts"].values,
+            )
+            y_global_is = np.mean(
+                [m.predict(X_train_neut) for m in global_models], axis=0)
+            y_residuals = y_train - y_global_is
+
+            # ── Stage 2: Expert EBMs on raw features per regime ────────
+            # `train_data` was sliced from `panel` BEFORE the winner-change
+            # branch attached LABEL_COL, so the label is refreshed here via
+            # a date→label map. Safe to run every fold — the lookup is a
+            # cheap dict map and stays in sync with the latest separator.
+            date_to_label = (
+                panel.drop_duplicates("ts").set_index("ts")[LABEL_COL]
+            )
+            train_data = train_data.copy()
+            train_data[LABEL_COL] = (
+                train_data["ts"].map(date_to_label).astype("float32")
+            )
+
+            # Use the actual (non-lagged) market regime label for IS.
+            train_regime_raw = train_data[LABEL_COL].apply(
+                lambda v: str(int(v)) if pd.notna(v) else "nan"
+            ).values
+
+            regime_tasks = []
+            for r_str in np.unique(train_regime_raw):
+                if r_str == "nan":
+                    continue
+                mask = train_regime_raw == r_str
+                if mask.sum() < 30:
+                    continue
+                regime_tasks.append((r_str, mask))
+
+            def _fit_one_expert(mask):
+                return _train_ebm_ensemble(
+                    X_train_raw[mask], y_residuals[mask], expert_ebm_kwargs,
+                    date_arr=train_data["ts"].values[mask],
+                    force_no_bagging=True,
+                )
+
+            expert_results = Parallel(
+                n_jobs=min(max(1, len(regime_tasks)), n_expert_jobs),
+                backend="loky",
+            )(
+                delayed(_fit_one_expert)(mask)
+                for _, mask in regime_tasks
+            )
+
+            expert_models_dict: dict = {}
+            for (r_str, _mask), experts in zip(regime_tasks, expert_results):
+                expert_models_dict[r_str] = experts
+                imp_e = _ensemble_importances(experts)
+                imp_e.name = str(pred_date.date())
+                all_expert_importances.setdefault(r_str, []).append(imp_e)
+
+            moe_ens = ResidualMoE(global_models, expert_models_dict)
+            models = moe_ens
+
+            # IS total predictions (uses actual non-lagged regime).
+            y_expert_is = np.zeros(len(X_train_raw))
+            for r_str, exps in expert_models_dict.items():
+                mask = train_regime_raw == r_str
+                if mask.sum() > 0:
+                    y_expert_is[mask] = np.mean(
+                        [m.predict(X_train_raw[mask]) for m in exps], axis=0)
+            y_pred_is = y_global_is + moe_boost_lambda * y_expert_is
+
+            imp_g = _ensemble_importances(global_models)
+            imp_g.name = str(pred_date.date())
+            all_importances.append(imp_g)
+
+            if save_models:
+                fold_path = os.path.join(
+                    model_dir,
+                    f"ebm_homoe_{pred_date.strftime('%Y%m%d')}.pkl")
+                with open(fold_path, "wb") as f:
+                    pickle.dump(moe_ens, f)
+
+            # IS fold metrics (same shape as walk_forward).
+            is_ic, _ = stats.spearmanr(y_pred_is, y_train)
+            ss_res = np.sum((y_train - y_pred_is) ** 2)
+            ss_tot = np.sum((y_train - np.mean(y_train)) ** 2)
+            is_r2 = 1.0 - ss_res / (ss_tot + 1e-12)
+            is_perf = _fold_portfolio_perf(
+                train_data, y_pred_is, quantile,
+                beta_col=beta_col if beta_neutral else None)
+            is_daily_rets.update(is_perf.get("daily_rets", {}))
+            all_fold_stats.append({
+                "fold_date":       pred_date,
+                "n_rows":          len(train_data),
+                "n_dates":         len(train_dates),
+                "is_ic":           float(is_ic),
+                "is_r2":           float(is_r2),
+                "is_sharpe":       is_perf["sharpe"],
+                "is_total_return": is_perf["total_return"],
+                "winner":          current_winner,
+            })
+            _first_train_logged = True
+
+        # ── Predict ──────────────────────────────────────────────────────
+        if models is None or panel_neutral is None:
+            continue
+
+        pred_neut = panel_neutral[panel_neutral["ts"] == pred_date].copy()
+        pred_neut = _fill_features(pred_neut)
+        if pred_neut.empty:
+            continue
+        pred_raw = panel[panel["ts"] == pred_date].copy()
+        pred_raw = _fill_features(pred_raw)
+
+        # Align raw features to neutralized row order (ts, symbol).
+        aligned_raw = (
+            pred_neut[["ts", "symbol"]]
+            .reset_index(drop=True)
+            .merge(pred_raw, on=["ts", "symbol"], how="left")
+        )
+        X_pred_neut = pred_neut[feature_cols].values
+        X_pred_raw = aligned_raw[feature_cols].fillna(0.0).values
+
+        active_regime = (
+            regime_selector.get_regime(pred_date)
+            if regime_selector else None
+        )
+        scores = models.predict_total(
+            X_pred_neut, active_regime, moe_boost_lambda,
+            X_expert=X_pred_raw,
+        )
+        all_preds[pred_date] = pd.Series(
+            scores, index=pred_neut["symbol"].values)
+
+        # Per-OOS-date timeline of (separator winner, lagged+hysteresis regime,
+        # number of symbols scored, expert availability for the active regime).
+        regime_timeline_rows.append({
+            "ts": pred_date,
+            "winner_separator": current_winner,
+            "active_regime": active_regime,
+            "n_symbols": int(len(pred_neut)),
+            "expert_available": bool(
+                active_regime is not None
+                and active_regime in models.expert_dict
+                and len(models.expert_dict[active_regime]) > 0
+            ),
+        })
+
+    if not all_preds:
+        raise RuntimeError(
+            "walk_forward_ho_moe: no predictions generated. Increase the "
+            "date range or reduce min_train_periods.")
+
+    predictions_wide = pd.DataFrame(all_preds).T
+    predictions_wide.index.name = "ts"
+    predictions_wide = predictions_wide.sort_index()
+
+    importance_df = (
+        pd.DataFrame(all_importances) if all_importances else pd.DataFrame()
+    )
+    fold_stats_df = pd.DataFrame(all_fold_stats)
+    if not fold_stats_df.empty:
+        fold_stats_df = fold_stats_df.set_index("fold_date")
+    is_rets = pd.Series(is_daily_rets, name="is_ret").sort_index()
+
+    expert_importance_dfs: dict | None = None
+    if all_expert_importances:
+        expert_importance_dfs = {
+            r: pd.DataFrame(imp_list)
+            for r, imp_list in all_expert_importances.items()
+        }
+
+    cmi_log_df = pd.DataFrame(cmi_log_rows)
+    if not cmi_log_df.empty:
+        cmi_log_df = cmi_log_df.set_index("fold_date")
+
+    regime_timeline_df = pd.DataFrame(regime_timeline_rows)
+    if not regime_timeline_df.empty:
+        regime_timeline_df = regime_timeline_df.set_index("ts").sort_index()
+
+    return (predictions_wide, importance_df, fold_stats_df, is_rets,
+            expert_importance_dfs, cmi_log_df, regime_timeline_df)
+
+
+# ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
 
@@ -886,8 +1416,8 @@ def plot_report(
     regime, allowing direct Global vs Expert comparison.
     """
     has_expert = bool(expert_importance_dfs)
-    n_rows = 4 if has_expert else 3
-    fig_height = 18 if has_expert else 14
+    n_rows = 5 if has_expert else 4
+    fig_height = 22 if has_expert else 17
 
     fig = plt.figure(figsize=(18, fig_height))
     gs = gridspec.GridSpec(n_rows, 2, figure=fig, hspace=0.45, wspace=0.35)
@@ -977,9 +1507,44 @@ def plot_report(
     else:
         ax4.text(0.5, 0.5, "No OOS returns data", ha="center", va="center")
 
-    # 5. Expert importances — most-represented regime (MoE only)
+    # 5. Coverage — active symbols per day (long + short legs separately)
+    ax5 = fig.add_subplot(gs[3, :])
+    if weights is not None and not weights.empty:
+        long_cnt = (weights > 0).sum(axis=1)
+        short_cnt = (weights < 0).sum(axis=1)
+        total_cnt = long_cnt + short_cnt
+        ax5.plot(total_cnt.index, total_cnt.values,
+                 color="#37474F", lw=1.2, label="Total active")
+        ax5.plot(long_cnt.index, long_cnt.values,
+                 color="#2E7D32", lw=1.0, alpha=0.85, label="Long leg")
+        ax5.plot(short_cnt.index, short_cnt.values,
+                 color="#C62828", lw=1.0, alpha=0.85, label="Short leg")
+        ax5.fill_between(total_cnt.index, 0, total_cnt.values,
+                         color="#37474F", alpha=0.07)
+        ax5.set_ylabel("Active symbols")
+        ax5.set_ylim(bottom=0)
+        ax5.legend(fontsize=8, loc="lower right")
+        cov_lines = [
+            f"Total : mean={total_cnt.mean():.1f}  min={total_cnt.min()}  max={total_cnt.max()}",
+            f"Long  : mean={long_cnt.mean():.1f}",
+            f"Short : mean={short_cnt.mean():.1f}",
+        ]
+        ax5.set_title(
+            "OOS Coverage  |  " + cov_lines[0],
+            fontsize=9, pad=4)
+        ax5.text(0.02, 0.97, "\n".join(cov_lines),
+                 transform=ax5.transAxes, fontsize=7.5, family="monospace",
+                 verticalalignment="top",
+                 bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
+                           alpha=0.85, edgecolor="#CCCCCC"))
+        ax5.tick_params(axis="x", labelrotation=30, labelsize=7)
+        ax5.xaxis.set_major_locator(plt.MaxNLocator(6))
+    else:
+        ax5.text(0.5, 0.5, "No coverage data", ha="center", va="center")
+
+    # 6. Expert importances — most-represented regime (MoE only)
     if has_expert:
-        ax6 = fig.add_subplot(gs[3, :])
+        ax6 = fig.add_subplot(gs[4, :])
         best_regime = max(
             expert_importance_dfs,
             key=lambda r: len(expert_importance_dfs[r])
@@ -1024,7 +1589,8 @@ def _run_epoch_pipeline(panel_epoch, feature_cols, args, ebm_kwargs,
     and rolling lookback windows warm up correctly.
 
     Returns (weights, predictions_wide, importance_df, fold_stats_df,
-             expert_importance_dfs).
+             expert_importance_dfs, cmi_log_df). `cmi_log_df` is None unless
+    --ho_moe is set, in which case it holds the per-fold tournament log.
     """
     ep = panel_epoch.copy()
 
@@ -1032,6 +1598,66 @@ def _run_epoch_pipeline(panel_epoch, feature_cols, args, ebm_kwargs,
         ep, args.target_col, args.target_horizon, args.target_type,
         beta_neutral=args.target_beta_neutral, beta_col=args.beta_col,
     )
+
+    # ── HO-MoE branch ─────────────────────────────────────────────────────
+    if args.ho_moe:
+        # Macro candidates are computed BEFORE normalize_features so they
+        # reflect raw cross-sectional market state (CS-mean volatility, CS-
+        # sum dollar volume, CS-std returns). normalize_features only acts
+        # on feature_cols, leaving the macro columns intact for CMI scoring
+        # and TS neutralization.
+        ep = compute_macro_candidates(ep)
+        ep = normalize_features(
+            ep, feature_cols, args.feature_norm, args.ts_z_window)
+
+        (predictions_wide, importance_df,
+         fold_stats_df, _is_rets,
+         expert_importance_dfs, cmi_log_df,
+         regime_timeline_df) = walk_forward_ho_moe(
+            panel=ep,
+            feature_cols=feature_cols,
+            target_col=args.target_col,
+            target_horizon=args.target_horizon,
+            target_type=args.target_type,
+            train_window=args.train_window,
+            retrain_freq=args.retrain_freq,
+            min_train_periods=args.min_train_periods,
+            beta_neutral=args.beta_neutral,
+            beta_col=args.beta_col,
+            quantile=args.quantile,
+            ebm_kwargs=ebm_kwargs,
+            expert_ebm_kwargs=expert_ebm_kwargs,
+            save_models=args.save_models,
+            model_dir=model_dir,
+            use_block_bagging=args.use_block_bagging,
+            n_outer_bags=args.n_outer_bags,
+            block_size=args.block_size,
+            embargo_pct=args.embargo_pct,
+            moe_boost_lambda=args.moe_boost_lambda,
+            moe_hysteresis=args.moe_hysteresis,
+            cmi_candidates=MACRO_CANDIDATES,
+            cmi_ema_span=args.cmi_ema_span,
+            cmi_q_target=args.cmi_q_target,
+            cmi_q_features=args.cmi_q_features,
+            cmi_q_candidates=args.cmi_q_candidates,
+            ts_neutral_window=args.ts_neutral_window,
+            ts_neutralize=args.adx_neutral,
+            fix_separator=args.ho_moe_fix_separator,
+            n_regimes=args.n_regimes,
+        )
+
+        if args.beta_neutral:
+            predictions_wide = neutralize_scores(
+                predictions_wide, ep, beta_col=args.beta_col)
+
+        weights = predictions_to_weights(
+            predictions_wide,
+            quantile=args.quantile,
+            max_weight=args.max_weight,
+            weight_mode=args.weight_mode,
+        )
+        return (weights, predictions_wide, importance_df, fold_stats_df,
+                expert_importance_dfs, cmi_log_df, regime_timeline_df)
 
     # Build RegimeSelector from the raw (pre-normalization) panel so that
     # regime column values are still the original integer labels (0/1/2).
@@ -1079,6 +1705,7 @@ def _run_epoch_pipeline(panel_epoch, feature_cols, args, ebm_kwargs,
         n_outer_bags=args.n_outer_bags,
         block_size=args.block_size,
         embargo_pct=args.embargo_pct,
+        bag_symbol_frac=args.bag_symbol_frac,
         use_moe=args.use_moe,
         regime_col=args.regime_col,
         moe_boost_lambda=args.moe_boost_lambda,
@@ -1086,6 +1713,7 @@ def _run_epoch_pipeline(panel_epoch, feature_cols, args, ebm_kwargs,
         expert_ebm_kwargs=expert_ebm_kwargs,
         regime_selector=raw_regime_selector,
         expert_panel=raw_panel_for_experts,
+        pred_start_date=getattr(args, "pred_start_date", None),
     )
 
     if args.beta_neutral:
@@ -1099,7 +1727,8 @@ def _run_epoch_pipeline(panel_epoch, feature_cols, args, ebm_kwargs,
         weight_mode=args.weight_mode,
     )
 
-    return weights, predictions_wide, importance_df, fold_stats_df, expert_importance_dfs
+    return (weights, predictions_wide, importance_df, fold_stats_df,
+            expert_importance_dfs, None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1168,14 +1797,21 @@ def main():
 
     # --- ADX feature neutralization ------------------------------------------
     ap.add_argument("--adx_neutral", action="store_true", default=False,
-                    help="Neutralize each feature against market_adx via rolling "
-                         "OLS before training. Removes the systematic component of "
-                         "each feature that co-varies with trending-market strength, "
-                         "leaving the idiosyncratic residual for the model to learn.")
+                    help="Neutralize each feature against the macro series via "
+                         "rolling OLS before training. Removes the systematic "
+                         "component of each feature that co-varies with the "
+                         "macro, leaving the idiosyncratic residual for the "
+                         "model to learn. Legacy path: neutralizes against "
+                         "--adx_col (default market_adx). HO-MoE path: "
+                         "neutralizes the Global model's features against the "
+                         "CMI-tournament winner (omit the flag to train the "
+                         "Global model on raw features — the Global vs Expert "
+                         "distinction then becomes market-wide vs regime-"
+                         "conditional alpha rather than residualized vs raw).")
     ap.add_argument("--adx_col",    default="market_adx",
                     help="Column name of the market-wide ADX series in the panel "
                          "(default: market_adx)")
-    ap.add_argument("--adx_neutral_window", type=int, default=30,
+    ap.add_argument("--adx_neutral_window", type=int, default=120,
                     help="Rolling window (trading days) for the ADX-beta OLS "
                          "(default: 252)")
 
@@ -1191,6 +1827,10 @@ def main():
     ap.add_argument("--outer_bags",           type=int,   default=1,
                     help="Outer bags for ensemble averaging (EBM default=8)")
     ap.add_argument("--min_samples_leaf",     type=int,   default=30)
+    ap.add_argument("--n_jobs",              type=int,   default=-2,
+                    help="Number of parallel jobs for EBM outer-bag fitting. "
+                         "-1 = all cores, -2 = all cores minus 1 (default), "
+                         "1 = sequential (old behaviour)")
     ap.add_argument("--random_state",         type=int,   default=42)
 
     # --- Block bagging -------------------------------------------------------
@@ -1202,11 +1842,18 @@ def main():
                     help="Block length in rows for block bootstrap (≈1 trading month)")
     ap.add_argument("--embargo_pct",   type=float, default=0.01,
                     help="Fraction of train window to embargo beyond target_horizon")
+    ap.add_argument("--bag_symbol_frac", type=float, default=1.0,
+                    help="Per-bag symbol subsample fraction in (0, 1]. "
+                         "1.0 = use all symbols (TIME-only diversity). "
+                         "0.8 = each bag keeps a random 80%% of symbols, "
+                         "decorrelating bags along the cross-sectional axis. "
+                         "Sampling is per-bag, leak-free (does not touch "
+                         "validation rows or any post-pred-date data).")
 
     # --- Mixture of Experts --------------------------------------------------
     ap.add_argument("--use_moe", action="store_true",
                     help="Enable Residual-Based Mixture of Experts (MoE) ensemble")
-    ap.add_argument("--regime_col", default="trend_regime_enc",
+    ap.add_argument("--regime_col", default="volatility_regime_enc",
                     help="Numeric column used for regime gating (must be integer-like). "
                          "Common choices: volatility_regime_enc, trend_regime_enc, "
                          "skew_regime_enc.")
@@ -1221,12 +1868,58 @@ def main():
                     help="Consecutive days the new regime must persist before switching "
                          "the active expert (reduces expert turnover).")
 
+    # --- Hierarchical Orthogonalized MoE (HO-MoE) ----------------------------
+    ap.add_argument("--ho_moe", action="store_true",
+                    help="Enable HO-MoE: every retrain runs a CMI tournament "
+                         "over (market_volatility, market_liquidity, "
+                         "market_dispersion) on the trailing IS panel. The "
+                         "EMA-smoothed winner becomes the active "
+                         "Regime_Separator; features are TS-neutralized "
+                         "against it for the Global model and a market-wide "
+                         "MoE routes per-regime experts. Implies --use_moe "
+                         "semantics and overrides --regime_col / --adx_neutral.")
+    ap.add_argument("--cmi_ema_span", type=int, default=3,
+                    help="EMA span (in folds) for the per-candidate CMI score "
+                         "tournament smoothing.")
+    ap.add_argument("--cmi_q_target",     type=int, default=3,
+                    help="Quantile bins for the target Y in CMI binning.")
+    ap.add_argument("--cmi_q_features",   type=int, default=3,
+                    help="Quantile bins for each feature X_i in CMI binning.")
+    ap.add_argument("--cmi_q_candidates", type=int, default=3,
+                    help="Quantile bins for each macro candidate R in CMI binning.")
+    ap.add_argument("--ts_neutral_window", type=int, default=30,
+                    help="Rolling window (trading days) for the per-symbol "
+                         "OLS used to TS-neutralize features against the "
+                         "winning macro separator (Pass 2).")
+    ap.add_argument("--n_regimes", type=int, default=3,
+                    help="Number of regime buckets for HO-MoE expert routing "
+                         "(time-series quantile of the winning macro series).")
+    ap.add_argument("--ho_moe_fix_separator", default=None,
+                    help="Skip the CMI tournament and use this column as the "
+                         "Regime_Separator for every retrain. Typical values: "
+                         "market_volatility, market_liquidity, market_dispersion. "
+                         "Use this to A/B test individual macro candidates as "
+                         "the regime axis against the legacy "
+                         "volatility_regime_enc baseline. Other panel columns "
+                         "(e.g. market_adx) are accepted but must exist after "
+                         "compute_macro_candidates + normalize_features run.")
+
     # --- Output --------------------------------------------------------------
     ap.add_argument("--save_models", action="store_true",
                     help="Pickle each fold's EBM model (can be large)")
     ap.add_argument("--no_rolling_universe", action="store_true",
                     help="Skip rolling universe epoch mask on weights. "
                          "Use this to baseline-test EBM signal correctness.")
+    ap.add_argument("--pred_start_date", default=None,
+                    help="First OOS prediction date (YYYY-MM-DD). All panel "
+                         "history before this date is kept and used for "
+                         "training, EWM warmup, and rolling features, but "
+                         "the walk-forward only emits predictions from this "
+                         "date onwards. Use when the panel includes warmup "
+                         "history (e.g. 2023) but tradeable performance "
+                         "should begin at a specific calendar date "
+                         "(e.g. 2024-01-01). The retrain schedule is "
+                         "anchored to this date.")
 
     args = ap.parse_args()
 
@@ -1243,12 +1936,24 @@ def main():
     print(f"  {len(panel):,} rows  |  {panel['symbol'].nunique()} symbols  |  "
           f"{panel['ts'].nunique()} dates")
 
+    # ── Optional: anchor first prediction date ────────────────────────────────
+    # Panel is NOT truncated. Pre-pred_start_date rows stay in the panel as
+    # warmup history (training data, EWM state, rolling features). The
+    # walk_forward simply skips emitting OOS predictions until pred_start_date,
+    # and anchors its retrain schedule to that date.
+    if args.pred_start_date:
+        ps = pd.to_datetime(args.pred_start_date)
+        warmup_dates = (panel["ts"] < ps).sum()
+        print(f"  [pred_start_date={args.pred_start_date}] "
+              f"first OOS prediction will be on or after {ps.date()}  |  "
+              f"warmup rows kept for training: {warmup_dates:,}")
+
     # ── Resolve feature columns ───────────────────────────────────────────────
     if args.features is not None and args.features not in (["all"], ["filtered"]):
         feature_cols = args.features
     elif args.features == ["all"]:
         numeric = panel.select_dtypes(include=[np.number]).columns.tolist()
-        exclude = _META_COLS | _SIGNAL_COLS | {"y"}
+        exclude = _META_COLS | _SIGNAL_COLS | {"y"} | _FILTERED_COLS
         feature_cols = [c for c in numeric if c not in exclude]
     else:
         feature_cols = [c for c in DEFAULT_FEATURES if c in panel.columns]
@@ -1275,6 +1980,7 @@ def main():
         inner_bags=args.inner_bags,
         outer_bags=args.outer_bags,
         min_samples_leaf=args.min_samples_leaf,
+        n_jobs=args.n_jobs,
         random_state=args.random_state,
         feature_names=feature_cols,
         # validation_size=0
@@ -1283,7 +1989,7 @@ def main():
 
     # Expert EBMs inherit global kwargs but override interactions and optionally lr.
     expert_ebm_kwargs: dict | None = None
-    if args.use_moe:
+    if args.use_moe or args.ho_moe:
         expert_ebm_kwargs = {**ebm_kwargs,
                              "interactions": args.expert_interactions}
         if args.expert_learning_rate is not None:
@@ -1312,45 +2018,120 @@ def main():
             end_str = panel["ts"].max().strftime("%Y-%m-%d")
             ru_epochs = ru.get_epochs(start_str, end_str)
 
+    # HO-MoE only — populated by the per-fold CMI tournament and the per-
+    # OOS-date regime gater. Default None so the CSV save blocks below work
+    # in non-HO-MoE runs.
+    cmi_log_df = None
+    regime_timeline_df = None
+
     if ru_epochs:
         print(f"\n  Rolling universe: {len(ru_epochs)} epochs — "
               f"training a separate EBM per epoch.")
-        weight_slices, pred_slices = [], []
-        imp_slices, fold_slices = [], []
-        expert_imp_slices: dict = {}
 
-        for ep in ru_epochs:
-            ep_start = pd.Timestamp(ep["epoch_start"])
-            ep_end = pd.Timestamp(ep["epoch_end"])
-            ep_syms = ep["symbols"]
-            print(f"\n  ── Epoch {ep['epoch_start']} → {ep['epoch_end']} "
-                  f"({len(ep_syms)} symbols) ──")
+        def _run_one_epoch(ep_dict):
+            """Train one epoch and return results with epoch metadata."""
+            ep_start = pd.Timestamp(ep_dict["epoch_start"])
+            ep_end = pd.Timestamp(ep_dict["epoch_end"])
+            ep_syms = ep_dict["symbols"]
 
-            # Full panel history for this epoch's symbols so that TS rolling
-            # windows and feature normalization warm up correctly.
             panel_ep = panel[panel["symbol"].isin(ep_syms)].copy()
             if panel_ep.empty:
-                print("    [skip] No panel rows for this epoch's symbols.")
-                continue
+                return None
 
-            w_ep, pred_ep, imp_ep, fold_ep, exp_ep = _run_epoch_pipeline(
+            (w_ep, pred_ep, imp_ep, fold_ep, exp_ep,
+             cmi_ep, reg_ep) = _run_epoch_pipeline(
                 panel_ep, feature_cols, args, ebm_kwargs,
                 expert_ebm_kwargs, model_dir,
             )
-            print(f"    Prediction matrix: {pred_ep.shape}")
 
-            # Slice to active date range only
-            w_ep = w_ep.loc[(w_ep.index >= ep_start) & (w_ep.index <= ep_end)]
-            pred_ep = pred_ep.loc[(pred_ep.index >= ep_start)
-                                  & (pred_ep.index <= ep_end)]
+            # Slice every per-epoch artifact to the epoch's active date
+            # range. Without this, an epoch whose universe was only valid
+            # in 2024 H1 would still contribute its 32 retrain rows (and
+            # the corresponding global / expert importance rows) across
+            # the whole panel calendar — polluting cross-epoch usage
+            # analysis with experts that never actually traded in those
+            # quarters.
+            def _slice_dt(df, idx_is_str=False):
+                if df is None or df.empty:
+                    return df
+                ts = pd.to_datetime(df.index) if idx_is_str else df.index
+                return df.loc[(ts >= ep_start) & (ts <= ep_end)]
+
+            w_ep = _slice_dt(w_ep)
+            pred_ep = _slice_dt(pred_ep)
+            reg_ep = _slice_dt(reg_ep)
+            cmi_ep = _slice_dt(cmi_ep)
+            # fold_stats_df / global importance frames use str(date) index;
+            # convert before comparing.
+            fold_ep = _slice_dt(fold_ep)
+            imp_ep = _slice_dt(imp_ep, idx_is_str=True)
+            # Importance frames keep all columns under .loc slicing — terms
+            # that only appeared in dropped folds become all-NaN ghost
+            # columns. Drop them so downstream aggregation reports honest
+            # presence counts.
+            if imp_ep is not None and not imp_ep.empty:
+                imp_ep = imp_ep.dropna(axis=1, how="all")
+            if exp_ep:
+                exp_ep = {
+                    r: _slice_dt(df, idx_is_str=True)
+                    for r, df in exp_ep.items()
+                }
+                exp_ep = {
+                    r: df.dropna(axis=1, how="all")
+                    for r, df in exp_ep.items()
+                    if df is not None and not df.empty
+                }
+                # Drop regimes that became empty after slicing — they had
+                # no folds inside the epoch's active range.
+                exp_ep = {r: df for r, df in exp_ep.items() if not df.empty}
+            return w_ep, pred_ep, imp_ep, fold_ep, exp_ep, cmi_ep, reg_ep
+
+        # Train all epochs. In HO-MoE the per-fold CMI EMA is stateful
+        # within an epoch but each epoch's state is fresh — epochs can
+        # still be parallelised. However the user specifically asked for
+        # sequential epoch processing when --ho_moe to keep the pipeline
+        # deterministic and trivially debuggable; we honour that.
+        if args.ho_moe:
+            n_epoch_jobs = 1
+            print(f"  Sequential epoch training (HO-MoE) for "
+                  f"{len(ru_epochs)} epochs")
+        else:
+            n_epoch_jobs = max(
+                1, min(len(ru_epochs), max(1, os.cpu_count() or 1)))
+            print(f"  Parallel epoch training: {n_epoch_jobs} jobs "
+                  f"for {len(ru_epochs)} epochs")
+
+        epoch_results = Parallel(n_jobs=n_epoch_jobs, backend="loky")(
+            delayed(_run_one_epoch)(ep) for ep in ru_epochs
+        ) if ru_epochs else []
+
+        weight_slices, pred_slices = [], []
+        imp_slices, fold_slices = [], []
+        expert_imp_slices: dict = {}
+        cmi_slices: list = []
+        regime_slices: list = []
+
+        for ep, result in zip(ru_epochs, epoch_results):
+            if result is None:
+                print(f"    [skip] Epoch {ep['epoch_start']} → "
+                      f"{ep['epoch_end']}: no panel rows.")
+                continue
+            (w_ep, pred_ep, imp_ep, fold_ep, exp_ep,
+             cmi_ep, reg_ep) = result
+            print(f"    Epoch {ep['epoch_start']} → {ep['epoch_end']}: "
+                  f"predictions {pred_ep.shape}")
             weight_slices.append(w_ep)
             pred_slices.append(pred_ep)
             if not imp_ep.empty:
                 imp_slices.append(imp_ep)
             if not fold_ep.empty:
                 fold_slices.append(fold_ep)
-            for regime_str, df in exp_ep.items():
+            for regime_str, df in (exp_ep or {}).items():
                 expert_imp_slices.setdefault(regime_str, []).append(df)
+            if cmi_ep is not None and not cmi_ep.empty:
+                cmi_slices.append(cmi_ep)
+            if reg_ep is not None and not reg_ep.empty:
+                regime_slices.append(reg_ep)
 
         all_dates = pd.DatetimeIndex(sorted(panel["ts"].unique()))
         weights = (
@@ -1369,6 +2150,12 @@ def main():
             fold_slices) if fold_slices else pd.DataFrame()
         expert_importance_dfs = {r: pd.concat(
             dfs) for r, dfs in expert_imp_slices.items()}
+        cmi_log_df = (
+            pd.concat(cmi_slices).sort_index() if cmi_slices else None
+        )
+        regime_timeline_df = (
+            pd.concat(regime_slices).sort_index() if regime_slices else None
+        )
 
         # OOS metrics need y_raw on the full panel. build_target adds it as a
         # plain forward return shift — no CS normalization, safe to run globally.
@@ -1384,72 +2171,146 @@ def main():
             panel, args.target_col, args.target_horizon, args.target_type,
             beta_neutral=args.target_beta_neutral, beta_col=args.beta_col,
         )
+        cmi_log_df = None
 
-        # Build RegimeSelector from raw panel before normalization corrupts labels.
-        raw_regime_selector = None
-        if args.use_moe and args.regime_col in panel.columns:
-            raw_regime_selector = RegimeSelector(
-                panel, args.regime_col, hysteresis=args.moe_hysteresis)
+        if args.ho_moe:
+            # HO-MoE branch — mirrors _run_epoch_pipeline so single-universe
+            # backtests can use the same pipeline.
+            panel = compute_macro_candidates(panel)
+            panel = normalize_features(
+                panel, feature_cols, args.feature_norm, args.ts_z_window)
 
-        panel = normalize_features(
-            panel, feature_cols, args.feature_norm, args.ts_z_window)
+            (predictions_wide, importance_df,
+             fold_stats_df, _is_rets,
+             expert_importance_dfs, cmi_log_df,
+             regime_timeline_df) = walk_forward_ho_moe(
+                panel=panel,
+                feature_cols=feature_cols,
+                target_col=args.target_col,
+                target_horizon=args.target_horizon,
+                target_type=args.target_type,
+                train_window=args.train_window,
+                retrain_freq=args.retrain_freq,
+                min_train_periods=args.min_train_periods,
+                beta_neutral=args.beta_neutral,
+                beta_col=args.beta_col,
+                quantile=args.quantile,
+                ebm_kwargs=ebm_kwargs,
+                expert_ebm_kwargs=expert_ebm_kwargs,
+                save_models=args.save_models,
+                model_dir=model_dir,
+                use_block_bagging=args.use_block_bagging,
+                n_outer_bags=args.n_outer_bags,
+                block_size=args.block_size,
+                embargo_pct=args.embargo_pct,
+                moe_boost_lambda=args.moe_boost_lambda,
+                moe_hysteresis=args.moe_hysteresis,
+                cmi_candidates=MACRO_CANDIDATES,
+                cmi_ema_span=args.cmi_ema_span,
+                cmi_q_target=args.cmi_q_target,
+                cmi_q_features=args.cmi_q_features,
+                cmi_q_candidates=args.cmi_q_candidates,
+                ts_neutral_window=args.ts_neutral_window,
+                ts_neutralize=args.adx_neutral,
+                fix_separator=args.ho_moe_fix_separator,
+                n_regimes=args.n_regimes,
+            )
+            print(f"  Prediction matrix: {predictions_wide.shape}")
 
-        panel_adx = None
-        if args.adx_neutral:
-            panel_adx = neutralize_features_on_adx(
-                panel, feature_cols,
-                adx_col=args.adx_col,
-                window=args.adx_neutral_window,
+            if args.beta_neutral:
+                print(f"\nBeta-neutralizing scores (col={args.beta_col})...")
+                predictions_wide = neutralize_scores(
+                    predictions_wide, panel, beta_col=args.beta_col)
+                print("  Done.")
+
+            weights = predictions_to_weights(
+                predictions_wide,
+                quantile=args.quantile,
+                max_weight=args.max_weight,
+                weight_mode=args.weight_mode,
+            )
+        else:
+            # ── Legacy single-pass (static MoE / no MoE) ──────────────────
+            # Build RegimeSelector from raw panel before normalization corrupts labels.
+            raw_regime_selector = None
+            if args.use_moe and args.regime_col in panel.columns:
+                raw_regime_selector = RegimeSelector(
+                    panel, args.regime_col, hysteresis=args.moe_hysteresis)
+
+            panel = normalize_features(
+                panel, feature_cols, args.feature_norm, args.ts_z_window)
+
+            panel_adx = None
+            if args.adx_neutral:
+                panel_adx = neutralize_features_on_adx(
+                    panel, feature_cols,
+                    adx_col=args.adx_col,
+                    window=args.adx_neutral_window,
+                )
+
+            # Global model uses ADX-neutralized features (if --adx_neutral);
+            # experts use raw normalized features to capture regime-specific alpha.
+            main_panel = panel_adx if panel_adx is not None else panel
+            raw_panel_for_experts = panel if panel_adx is not None else None
+
+            (predictions_wide, importance_df,
+             fold_stats_df, _is_rets,
+             expert_importance_dfs) = walk_forward(
+                panel=main_panel,
+                feature_cols=feature_cols,
+                target_col=args.target_col,
+                target_horizon=args.target_horizon,
+                target_type=args.target_type,
+                train_window=args.train_window,
+                retrain_freq=args.retrain_freq,
+                min_train_periods=args.min_train_periods,
+                beta_neutral=args.beta_neutral,
+                beta_col=args.beta_col,
+                quantile=args.quantile,
+                ebm_kwargs=ebm_kwargs,
+                save_models=args.save_models,
+                model_dir=model_dir,
+                use_block_bagging=args.use_block_bagging,
+                n_outer_bags=args.n_outer_bags,
+                block_size=args.block_size,
+                embargo_pct=args.embargo_pct,
+                bag_symbol_frac=args.bag_symbol_frac,
+                use_moe=args.use_moe,
+                regime_col=args.regime_col,
+                moe_boost_lambda=args.moe_boost_lambda,
+                moe_hysteresis=args.moe_hysteresis,
+                expert_ebm_kwargs=expert_ebm_kwargs,
+                regime_selector=raw_regime_selector,
+                expert_panel=raw_panel_for_experts,
+                pred_start_date=getattr(args, "pred_start_date", None),
+            )
+            print(f"  Prediction matrix: {predictions_wide.shape}")
+
+            if args.beta_neutral:
+                print(f"\nBeta-neutralizing scores (col={args.beta_col})...")
+                predictions_wide = neutralize_scores(
+                    predictions_wide, main_panel, beta_col=args.beta_col)
+                print("  Done.")
+
+            weights = predictions_to_weights(
+                predictions_wide,
+                quantile=args.quantile,
+                max_weight=args.max_weight,
+                weight_mode=args.weight_mode,
             )
 
-        # Global model uses ADX-neutralized features (if --adx_neutral);
-        # experts use raw normalized features to capture regime-specific alpha.
-        main_panel = panel_adx if panel_adx is not None else panel
-        raw_panel_for_experts = panel if panel_adx is not None else None
-
-        (predictions_wide, importance_df,
-         fold_stats_df, _is_rets,
-         expert_importance_dfs) = walk_forward(
-            panel=main_panel,
-            feature_cols=feature_cols,
-            target_col=args.target_col,
-            target_horizon=args.target_horizon,
-            target_type=args.target_type,
-            train_window=args.train_window,
-            retrain_freq=args.retrain_freq,
-            min_train_periods=args.min_train_periods,
-            beta_neutral=args.beta_neutral,
-            beta_col=args.beta_col,
-            quantile=args.quantile,
-            ebm_kwargs=ebm_kwargs,
-            save_models=args.save_models,
-            model_dir=model_dir,
-            use_block_bagging=args.use_block_bagging,
-            n_outer_bags=args.n_outer_bags,
-            block_size=args.block_size,
-            embargo_pct=args.embargo_pct,
-            use_moe=args.use_moe,
-            regime_col=args.regime_col,
-            moe_boost_lambda=args.moe_boost_lambda,
-            moe_hysteresis=args.moe_hysteresis,
-            expert_ebm_kwargs=expert_ebm_kwargs,
-            regime_selector=raw_regime_selector,
-            expert_panel=raw_panel_for_experts,
-        )
-        print(f"  Prediction matrix: {predictions_wide.shape}")
-
-        if args.beta_neutral:
-            print(f"\nBeta-neutralizing scores (col={args.beta_col})...")
-            predictions_wide = neutralize_scores(
-                predictions_wide, main_panel, beta_col=args.beta_col)
-            print("  Done.")
-
-        weights = predictions_to_weights(
-            predictions_wide,
-            quantile=args.quantile,
-            max_weight=args.max_weight,
-            weight_mode=args.weight_mode,
-        )
+    # ── Trim OOS outputs to pred_start_date ──────────────────────────────────
+    # All warmup-period rows in weights / predictions_wide are dropped here so
+    # downstream metrics, parquet files, and plots reflect only the tradeable
+    # OOS window. Pre-pred_start_date rows were kept upstream solely for
+    # training warmup and are no longer needed.
+    if args.pred_start_date:
+        ps = pd.Timestamp(args.pred_start_date)
+        before_w = len(weights)
+        weights = weights.loc[weights.index >= ps]
+        predictions_wide = predictions_wide.loc[predictions_wide.index >= ps]
+        print(f"  Trimmed OOS outputs to ts >= {ps.date()}: "
+              f"{before_w} → {len(weights)} dates")
 
     # ── OOS metrics ──────────────────────────────────────────────────────────
     print("Computing OOS metrics...")
@@ -1506,6 +2367,22 @@ def main():
             exp_df.to_csv(exp_imp_path)
             print(
                 f"Expert importance (regime={regime_str}) saved → {exp_imp_path}")
+
+    # HO-MoE CMI tournament log
+    if cmi_log_df is not None and not cmi_log_df.empty:
+        cmi_path = os.path.join(out_dir, "ebm_homoe_cmi_log.csv")
+        cmi_log_df.to_csv(cmi_path)
+        print(f"HO-MoE CMI log saved → {cmi_path}")
+        winner_counts = cmi_log_df["winner"].value_counts()
+        print(f"  Winner distribution across {len(cmi_log_df)} folds:")
+        for w, c in winner_counts.items():
+            print(f"    {w:<25s} {c:>4d}  ({c / len(cmi_log_df):.0%})")
+
+    # HO-MoE per-OOS-date regime timeline (separator winner + active regime).
+    if regime_timeline_df is not None and not regime_timeline_df.empty:
+        reg_path = os.path.join(out_dir, "ebm_homoe_regime_timeline.csv")
+        regime_timeline_df.to_csv(reg_path)
+        print(f"HO-MoE regime timeline saved → {reg_path}")
 
     if not fold_stats_df.empty:
         fold_path = os.path.join(out_dir, "ebm_fold_stats.csv")

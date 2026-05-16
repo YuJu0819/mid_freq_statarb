@@ -25,7 +25,7 @@ class LiquidationReversalStrategy:
     def calculate_ts_zscore(self, df: pd.DataFrame, window: int) -> pd.DataFrame:
         rolling_mean = df.rolling(window=window, min_periods=window//2).mean()
         rolling_std = df.rolling(window=window, min_periods=window//2).std()
-        return (df - rolling_mean) / rolling_std.replace(0, np.nan)
+        return (df - rolling_mean) / rolling_std.replace(0, np.nan).clip(-2, 2)
 
     def calculate_cs_zscore(self, df_wide: pd.DataFrame) -> pd.DataFrame:
         means = df_wide.mean(axis=1)
@@ -111,29 +111,31 @@ class LiquidationReversalStrategy:
             ls_dict[sym] = df.set_index('ts')['ls_ratio']
             close_dict[sym] = df.set_index('ts')['futures_close']
 
-        df_oi = pd.DataFrame(oi_dict).ffill().fillna(0)
-        df_ls = pd.DataFrame(ls_dict).ffill().fillna(1.0)
+        df_oi = pd.DataFrame(oi_dict).ffill()
+        df_ls = pd.DataFrame(ls_dict).ffill()
         df_close = pd.DataFrame(close_dict).ffill()
 
         raw_oi_chg = df_oi.pct_change().replace(
-            [np.inf, -np.inf], np.nan).rolling(window=7).mean()
-        raw_ls_chg = df_ls.diff().replace([np.inf, -np.inf], np.nan)  # noqa: F841
+            [np.inf, -np.inf], np.nan).rolling(window=3).mean()
+        raw_ls_chg = df_ls.pct_change().replace([np.inf, -np.inf], np.nan).rolling(window=3).mean()  # noqa: F841
 
         # CS zscore uses only active_symbols → consistent distribution within epoch
-        cs_z_oi_chg = self.calculate_cs_zscore(raw_oi_chg)
+        cs_z_oi_chg = self.calculate_ts_zscore(raw_oi_chg, self.ts_lookback)
         final_z_oi_chg = self.calculate_ts_zscore(
             cs_z_oi_chg, self.ts_lookback)
+        cs_z_ls_chg = self.calculate_ts_zscore(raw_ls_chg, self.ts_lookback)
+        liquidation_shock = (-cs_z_oi_chg).clip(
+            lower=0)
 
-        liquidation_shock = (-final_z_oi_chg).clip(
-            lower=0.0)
-
-        ma_trend = df_close.rolling(window=self.sentiment_ma_window).mean()
-        std_trend = df_close.rolling(window=self.sentiment_ma_window).std()
-        regime_score = ((df_close.rolling(window=self.regime_window).mean() - ma_trend) /
-                        std_trend).clip(-3, 3).fillna(0.0)
-        regime_filter = self.calculate_cs_zscore(regime_score)
-        regime_score = regime_score.mask(
-            regime_filter.abs() < self.regime_filter_threshold, 0)
+        # ma_trend = df_close.rolling(window=self.sentiment_ma_window).mean()
+        # std_trend = df_close.rolling(window=self.sentiment_ma_window).std()
+        # regime_score = ((df_close.rolling(window=self.regime_window).mean() - ma_trend) /
+        #                 std_trend).clip(-3, 3).fillna(0.0)
+        regime_score = (-cs_z_ls_chg).clip(lower=0)
+        # regime_filter = self.calculate_cs_zscore(regime_score)
+        # regime_filter = -cs_z_ls_chg
+        # regime_score = regime_score.mask(
+        #     regime_filter.abs() < self.regime_filter_threshold, 0)
 
         interaction_alpha = liquidation_shock * regime_score
 
@@ -157,13 +159,26 @@ class LiquidationReversalStrategy:
         ia_pct = abs_ia_active.rank(axis=1, pct=True)
         q1_mask = is_active & (ia_pct >= 0.5)
 
-        # 2. Apply mask
-        final_signal = final_signal.where(q1_mask, 0.0)
+        # Preserve UNMASKED signal for EBM consumption. The mask is a
+        # trading-side filter (reject weakest-conviction names). The EBM
+        # should see the full signal distribution so it can learn which
+        # conviction levels actually predict forward return.
+        final_signal_unmasked = final_signal.copy()
 
-        # 3. Normalize AFTER masking so surviving weights get full leverage
+        # 2. Apply mask (currently disabled; uncomment to enable q1 cull)
+        # final_signal = final_signal.where(q1_mask, 0.0)
+
+        # 3. Normalize AFTER masking so surviving weights get full leverage.
+        # Compute BOTH normalizations independently — when the mask is
+        # disabled they're identical; when enabled the unmasked version
+        # preserves its own L1-normalization.
         total_signal_strength = final_signal.abs().sum(axis=1).replace(0, 1.0)
         final_weights = final_signal.div(
             total_signal_strength, axis=0) * self.leverage_scale
+
+        total_unmasked = final_signal_unmasked.abs().sum(axis=1).replace(0, 1.0)
+        final_weights_unmasked = final_signal_unmasked.div(
+            total_unmasked, axis=0) * self.leverage_scale
 
         def _stack(wide: pd.DataFrame, name: str) -> pd.Series:
             s = wide.stack()
@@ -180,7 +195,7 @@ class LiquidationReversalStrategy:
             _stack(final_weights,     'position_qty'),
         ], axis=1).reset_index()
 
-        return final_weights, score_history_df
+        return final_weights, final_weights_unmasked, score_history_df
 
     def generate_all_signals(self, all_data: dict, epoch_mask_df=None):
         """
@@ -232,7 +247,10 @@ class LiquidationReversalStrategy:
             epoch_date_ranges.append((ep_start, ep_end, list(sym_set)))
 
         # --- Per-epoch signal computation ---
+        # Both masked and unmasked weight slices are collected so the engine
+        # can route them to PnL vs. EBM-panel parquet respectively.
         weight_slices = []
+        weight_unmasked_slices = []
         score_slices = []
 
         for ep_start, ep_end, active_symbols in epoch_date_ranges:
@@ -242,35 +260,35 @@ class LiquidationReversalStrategy:
             print(f"  [Reversal] Epoch {ep_start.date()} → {ep_end.date()} "
                   f"({len(active_symbols)} symbols)")
 
-            weights_ep, scores_ep = self._compute_signals_for_symbols(
-                all_data, active_symbols)
+            weights_ep, weights_unmasked_ep, scores_ep = \
+                self._compute_signals_for_symbols(all_data, active_symbols)
 
-            # Slice to active date range only
-            weights_slice = weights_ep.loc[
-                (weights_ep.index >= ep_start) & (weights_ep.index <= ep_end)
-            ]
+            date_mask = (
+                (weights_ep.index >= ep_start) & (weights_ep.index <= ep_end))
+            weights_slice = weights_ep.loc[date_mask]
+            weights_unmasked_slice = weights_unmasked_ep.loc[date_mask]
             scores_slice = scores_ep[
                 (scores_ep['ts'] >= ep_start) & (scores_ep['ts'] <= ep_end)
             ]
 
             weight_slices.append(weights_slice)
+            weight_unmasked_slices.append(weights_unmasked_slice)
             score_slices.append(scores_slice)
 
         if not weight_slices:
             empty_w = pd.DataFrame(0.0, index=epoch_mask_df.index,
                                    columns=epoch_mask_df.columns)
-            return empty_w, pd.DataFrame()
+            return empty_w, empty_w.copy(), pd.DataFrame()
 
         # Concatenate and reindex to full date range with 0 for any missing dates
-        final_weights = (
-            pd.concat(weight_slices)
-            .reindex(all_dates)
-            .fillna(0.0)
-        )
-        # Align columns to full universe
-        final_weights = final_weights.reindex(
-            columns=epoch_mask_df.columns, fill_value=0.0)
+        def _assemble(slices):
+            out = (pd.concat(slices)
+                   .reindex(all_dates)
+                   .fillna(0.0))
+            return out.reindex(columns=epoch_mask_df.columns, fill_value=0.0)
 
+        final_weights = _assemble(weight_slices)
+        final_weights_unmasked = _assemble(weight_unmasked_slices)
         final_scores = pd.concat(score_slices, ignore_index=True)
 
-        return final_weights, final_scores
+        return final_weights, final_weights_unmasked, final_scores

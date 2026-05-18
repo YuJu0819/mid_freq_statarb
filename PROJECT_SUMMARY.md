@@ -88,7 +88,7 @@ construction invariants that are applied at every stage of the pipeline:
 
 ### 3.1 Liquidation Reversal
 
-![Liquidation reversal equity curve](reports/strategies/EBM_rolling/equity_curve_reversal.png)
+![Liquidation reversal equity curve](docs/img/equity_curve_reversal.png)
 
 |                   |        |
 | ----------------- | ------ |
@@ -98,7 +98,7 @@ construction invariants that are applied at every stage of the pipeline:
 
 ### 3.2 Momentum
 
-![Momentum equity curve](reports/equity_curve_2024-01-01_to_2025-12-31.png)
+![Momentum equity curve](docs/img/momentum_equity.png)
 
 |                   |        |
 | ----------------- | ------ |
@@ -108,7 +108,7 @@ construction invariants that are applied at every stage of the pipeline:
 
 ### 3.3 EBM ML Signal
 
-![EBM walk-forward summary](reports/EBM_for_README.png)
+![EBM walk-forward summary](docs/img/EBM_for_README.png)
 
 - **Top:** per-fold feature importance.
 - **Bottom-left:** in-sample vs out-of-sample information coefficient
@@ -119,16 +119,16 @@ construction invariants that are applied at every stage of the pipeline:
 | ---------------------- | ---- |
 | Final return           | 62.6% |
 | Annualised Sharpe      | 1.56 |
-| PSR (SR*=0)              | 99.98 |
+| PSR (SR\* = 0)         | 99.98 |
 
 ### 3.4 Combined Portfolio
 
 - Blends the three signals through the strategy-space mean-variance
   optimiser.
 
-![Combined portfolio equity curve](reports/strategies/EBM_rolling/equity_cross_signal_mv.png)
+![Combined portfolio equity curve](docs/img/equity_cross_signal_mv.png)
 
-![Portfolio weight distribution](reports/strategies/EBM_rolling/weight_distribution_cross_signal_mv.png)
+![Portfolio weight distribution](docs/img/weight_distribution_cross_signal_mv.png)
 
 - The lower panel reports **gross leverage and net exposure**,
   **long-short asset counts**, the **effective number of positions**,

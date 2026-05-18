@@ -2,6 +2,7 @@ data/
 data/
 reports/
 data_v1/
+reports_reversal_daily/
+cache/parquet/parquet/
 __pycache__/
 .env.example
-reports_reversal_daily/

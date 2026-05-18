@@ -4,7 +4,7 @@ general:
   parquet_dir: ./data/parquet
   log_level: INFO
 backtest:
-  fee_bps: 10
+  fee_bps: 0
   slippage_bps: 0
   rebalance_period: 1d
   initial_cash: 100000

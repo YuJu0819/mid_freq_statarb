@@ -4,3 +4,4 @@ reports/
 data_v1/
 __pycache__/
 .env.example
+reports_reversal_daily/

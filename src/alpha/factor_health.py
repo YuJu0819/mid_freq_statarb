@@ -61,13 +61,18 @@ _NON_NUMERIC_BIN = re.compile(r"^(missing|unseen|\$undef\$)$", re.IGNORECASE)
 def _extract_univariate_shape(
     explanation,
     feat_idx: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
     """
-    Pull (bin_centers, scores, density) for one univariate term.
+    Pull (bin_centers, scores, density, keep_mask) for one univariate term.
 
     Returns None when the term is an interaction (pairwise), categorical, or
     has too few numeric bins to be meaningful. Interaction terms are skipped
     here — the PDF's framework is about per-feature shape, not pair surfaces.
+
+    `keep_mask` is the boolean filter (length = raw bin count) that strips
+    Missing/Unseen tail bins. Callers that need to slice the raw per-bag
+    matrix from `m.bagged_scores_` apply the same mask to keep bin layouts
+    consistent.
 
     Bin centers (not edges) are returned because the rank correlation
     against `scores` only makes sense at one-per-bin granularity.
@@ -177,7 +182,67 @@ def _extract_univariate_shape(
     if not np.isfinite(density).any() or density.sum() <= 0:
         density = np.ones_like(density)
 
-    return centers, scores, density
+    return centers, scores, density, keep_mask
+
+
+def _extract_per_bag_scores(
+    model,
+    feat_idx: int,
+    keep_mask: np.ndarray,
+) -> np.ndarray | None:
+    """
+    Read per-bag bin scores for term `feat_idx` from a single fitted EBM.
+
+    interpret stores per-bag bin scores in `m.bagged_scores_` as a list
+    (one entry per term), each entry an array of shape `(n_bags, n_bins)`.
+    `m.term_scores_[feat_idx]` (and by extension `explain_global().data(i)
+    ["scores"]`) is the bag-AVERAGE of that matrix.
+
+    Layout alignment
+    ----------------
+    `bagged_scores_[i]` includes TWO sentinel columns that `explain_global`
+    strips: column 0 is the "Missing" bin (always 0) and column -1 is the
+    "Unseen" bin (always 0). Empirically verified:
+      term_scores_[i][1:-1] == explain_global().data(i)["scores"]
+    So we slice [:, 1:-1] before applying the analyzer's keep_mask, which
+    addresses any remaining Missing/Unseen in the score-bin layout.
+
+    Reading the bags directly lets us measure per-bag dispersion — which
+    is what the cross-bag-variance metric needs but couldn't see when the
+    analyzer only iterated over the outer EBM list (always length 1 in
+    the trainer, whether or not block bagging is on).
+
+    Returns
+    -------
+    (n_bags, n_kept_bins) array, or None when bagged_scores_ is missing
+    or the bin layout can't be aligned.
+    """
+    bagged = getattr(model, "bagged_scores_", None)
+    if bagged is None:
+        return None
+    try:
+        mat = np.asarray(bagged[feat_idx], dtype=float)
+    except (IndexError, TypeError, ValueError):
+        return None
+    if mat.ndim != 2:
+        return None
+    n_bags, n_bins_raw = mat.shape
+    if n_bags < 2:
+        return None
+    # Strip the leading "Missing" + trailing "Unseen" sentinels when the
+    # bag matrix is exactly 2 wider than the analyzer's bin count.
+    if n_bins_raw == keep_mask.size + 2:
+        mat = mat[:, 1:-1]
+    elif n_bins_raw == keep_mask.size + 1:
+        # Older interpret versions occasionally pad by 1.
+        mat = mat[:, :keep_mask.size]
+    elif n_bins_raw == keep_mask.size:
+        pass
+    elif n_bins_raw == keep_mask.size - 1:
+        keep_mask = keep_mask[:n_bins_raw]
+    else:
+        return None
+    return mat[:, keep_mask]
 
 
 # ---------------------------------------------------------------------------
@@ -352,8 +417,12 @@ class FactorHealthEvaluator:
         if not bag_models:
             raise ValueError("evaluate_ensemble: bag_models is empty.")
 
-        # Use bag 0 as the "canonical" shape, augment with cross-bag variance
-        # computed against the rest of the bags.
+        # Use bag 0 as the "canonical" shape for centres/density/scores.
+        # The bag-AVERAGED shape (returned by explain_global) is the right
+        # input for monotonicity / tail-core / curvature — those describe
+        # the model's effective learned function. Cross-bag variance, by
+        # contrast, needs the INDIVIDUAL bags' bin scores, which interpret
+        # exposes via `m.bagged_scores_` rather than as separate models.
         canon = bag_models[0]
         try:
             exp_canon = canon.explain_global()
@@ -366,23 +435,26 @@ class FactorHealthEvaluator:
         # analyzer, not via shape geometry (their "shape" is 2-D).
         term_names = list(canon.term_names_)
 
-        # Pre-compute other bags' explanations once for cross-bag var.
-        bag_explanations = [exp_canon]
-        for m in bag_models[1:]:
-            try:
-                bag_explanations.append(m.explain_global())
-            except Exception:
-                bag_explanations.append(None)
+        # Legacy fallback: if multiple EBMs are passed (e.g. the old
+        # smoke-test pattern of training N independent EBMs and asking for
+        # cross-model dispersion), retain the old per-EBM iteration so the
+        # function stays useful when `bagged_scores_` isn't available.
+        extra_explanations: list = []
+        if len(bag_models) > 1:
+            for m in bag_models[1:]:
+                try:
+                    extra_explanations.append(m.explain_global())
+                except Exception:
+                    extra_explanations.append(None)
 
         rows = []
         for idx, term in enumerate(term_names):
-            # Skip interaction terms (those carry ' & ' or are >1-D in scores)
             if " & " in term:
                 continue
             shape = _extract_univariate_shape(exp_canon, idx)
             if shape is None:
                 continue
-            centers, scores, density = shape
+            centers, scores, density, keep_mask = shape
 
             mono = _weighted_spearman(centers, scores, density)
             tcr = _tail_core_ratio(
@@ -390,23 +462,30 @@ class FactorHealthEvaluator:
                 core_density_thresh=self.core_density_thresh)
             curv = _curvature(scores)
 
-            # Cross-bag variance for this term across all bags.
-            other_scores = []
-            for be in bag_explanations:
-                if be is None:
-                    continue
-                # Locate the term by name in this bag (term index can drift
-                # between bags when EBM auto-prunes empty bins). Fall back
-                # to positional match.
-                try:
-                    bag_idx = list(be.feature_names).index(term)
-                except (AttributeError, ValueError):
-                    bag_idx = idx
-                s = _extract_univariate_shape(be, bag_idx)
-                if s is None:
-                    continue
-                other_scores.append(s[1])
-            cb_var = _cross_bag_variance(other_scores, density)
+            # Cross-bag variance: prefer the TRUE per-bag scores from
+            # canon.bagged_scores_; fall back to the (legacy) per-EBM
+            # iteration when bagged_scores_ isn't exposed.
+            cb_var = 0.0
+            per_bag_mat = _extract_per_bag_scores(canon, idx, keep_mask)
+            if per_bag_mat is not None and per_bag_mat.shape[0] >= 2:
+                cb_var = _cross_bag_variance(
+                    [per_bag_mat[b] for b in range(per_bag_mat.shape[0])],
+                    density)
+            elif extra_explanations:
+                # Legacy multi-EBM path.
+                other_scores = [scores]
+                for be in extra_explanations:
+                    if be is None:
+                        continue
+                    try:
+                        bag_idx = list(be.feature_names).index(term)
+                    except (AttributeError, ValueError):
+                        bag_idx = idx
+                    s = _extract_univariate_shape(be, bag_idx)
+                    if s is None:
+                        continue
+                    other_scores.append(s[1])
+                cb_var = _cross_bag_variance(other_scores, density)
 
             rows.append({
                 "feature": term,

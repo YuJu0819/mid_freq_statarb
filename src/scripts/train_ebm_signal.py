@@ -400,6 +400,7 @@ def walk_forward(
     block_size: int = 21,
     embargo_pct: float = 0.01,
     bag_symbol_frac: float = 1.0,
+    bag_sym_excluded_as_val: bool = False,
     # ── MoE ────────────────────────────────────────────────────────────
     use_moe: bool = False,
     regime_col: str = "volatility_regime_enc",
@@ -520,6 +521,7 @@ def walk_forward(
         date_arr: np.ndarray | None = None,
         symbol_arr: np.ndarray | None = None,
         symbol_frac: float = 1.0,
+        sym_excluded_as_val: bool = False,
     ) -> np.ndarray:
         """Build a (n_samples × n_bags) bags matrix with temporal validation.
 
@@ -528,7 +530,13 @@ def walk_forward(
                   (block-bootstrap-with-replacement count for the row's date,
                   zero-ed if the row's symbol is not in the bag's symbol subset)
           -1    : row is in this bag's validation holdout (last val_dates,
-                  identical across bags for early-stopping consistency)
+                  identical across bags for early-stopping consistency).
+                  When `sym_excluded_as_val=True` the symbols this bag
+                  dropped via subsampling ALSO join the validation set
+                  (per-bag, so each bag has a different val population) —
+                  blends temporal and cross-sectional generalization into
+                  the early-stopping signal. Default False keeps the
+                  legacy "pure temporal val" semantics.
            0    : row is excluded from this bag
 
         Diversity sources (all leak-free — sampling never touches the
@@ -554,7 +562,7 @@ def walk_forward(
             row_date_idx = np.array([date_to_idx[d] for d in date_arr])
 
             # Validation: last 20% of training dates (early-stopping holdout)
-            val_dates = int(n_dates * 0.2)
+            val_dates = int(n_dates * 0.1)
             train_date_cutoff = n_dates - val_dates
             train_row_mask = row_date_idx < train_date_cutoff
 
@@ -602,6 +610,14 @@ def walk_forward(
                     train_row_mask & sym_active & (row_counts > 0),
                     row_counts, 0,
                 ).astype(np.int16)
+                # Opt-in: symbol-excluded training rows join this bag's
+                # validation set instead of being skipped. Done BEFORE the
+                # time-based pin so the time-based -1 takes precedence on
+                # the validation tail (where sym subsampling is irrelevant).
+                if sym_excluded_as_val and do_sym_sub:
+                    sym_excluded_train = (
+                        train_row_mask & ~sym_active)
+                    bag_col[sym_excluded_train] = -1
                 # Restore validation pin for this column (always -1)
                 bag_col[~train_row_mask] = -1
                 mat[:, b] = bag_col
@@ -658,6 +674,7 @@ def walk_forward(
                 n, n_outer_bags, use_blocks=True,
                 date_arr=date_arr, symbol_arr=symbol_arr,
                 symbol_frac=bag_symbol_frac,
+                sym_excluded_as_val=bag_sym_excluded_as_val,
             )
             kwargs_bag = {**kwargs, "outer_bags": n_outer_bags}
             m = ExplainableBoostingRegressor(**kwargs_bag)
@@ -1706,6 +1723,7 @@ def _run_epoch_pipeline(panel_epoch, feature_cols, args, ebm_kwargs,
         block_size=args.block_size,
         embargo_pct=args.embargo_pct,
         bag_symbol_frac=args.bag_symbol_frac,
+        bag_sym_excluded_as_val=args.bag_sym_excluded_as_val,
         use_moe=args.use_moe,
         regime_col=args.regime_col,
         moe_boost_lambda=args.moe_boost_lambda,
@@ -1849,6 +1867,22 @@ def main():
                          "decorrelating bags along the cross-sectional axis. "
                          "Sampling is per-bag, leak-free (does not touch "
                          "validation rows or any post-pred-date data).")
+    ap.add_argument("--bag_sym_excluded_as_val", action="store_true",
+                    help="When --bag_symbol_frac < 1.0, route the symbol-"
+                         "excluded TRAINING rows into this bag's validation "
+                         "set (interpret -1) instead of skipping them "
+                         "(interpret 0). Effect: early-stopping per bag is "
+                         "informed by cross-sectional generalization in "
+                         "addition to the time-based holdout. Useful when "
+                         "you want bags to stop at different boosting "
+                         "rounds (more ensemble diversity) and you believe "
+                         "the signal should generalize to unseen symbols "
+                         "within the training window. CAUTION: with low "
+                         "bag_symbol_frac (e.g. 0.5) the symbol-val portion "
+                         "can dwarf the time-val portion and shift the "
+                         "objective away from pure temporal generalization. "
+                         "Default off — opt in to A/B against the legacy "
+                         "behaviour.")
 
     # --- Mixture of Experts --------------------------------------------------
     ap.add_argument("--use_moe", action="store_true",
@@ -2275,6 +2309,7 @@ def main():
                 block_size=args.block_size,
                 embargo_pct=args.embargo_pct,
                 bag_symbol_frac=args.bag_symbol_frac,
+                bag_sym_excluded_as_val=args.bag_sym_excluded_as_val,
                 use_moe=args.use_moe,
                 regime_col=args.regime_col,
                 moe_boost_lambda=args.moe_boost_lambda,

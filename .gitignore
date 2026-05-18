@@ -6,3 +6,4 @@ reports_reversal_daily/
 cache/parquet/parquet/
 __pycache__/
 .env.example
+.claude/

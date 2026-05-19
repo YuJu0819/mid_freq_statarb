@@ -41,7 +41,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-from ..alpha.ml_utils import compute_ic, neutralize_scores
+from ...alpha.ml_utils import compute_ic, neutralize_scores
 
 
 # ---------------------------------------------------------------------------

@@ -59,9 +59,11 @@ Usage
       --use_moe --regime_col volatility_regime_enc \\
       --moe_boost_lambda 0.5 --expert_interactions 5 --moe_hysteresis 3
 """
-from ..core.utils import ensure_dir
-from ..data.rolling_universe import RollingUniverse, build_symbol_active_mask
-from ..alpha.ml_utils import (
+from ...core.utils import ensure_dir
+from ...data.rolling_universe import (
+    RollingUniverse, build_symbol_active_mask, resolve_epochs,
+)
+from ...alpha.ml_utils import (
     normalize_features,
     neutralize_features_on_adx,
     build_target,
@@ -70,7 +72,7 @@ from ..alpha.ml_utils import (
     compute_portfolio_performance,
     compute_ic,
 )
-from ..alpha.ho_moe import (
+from ...alpha.ho_moe import (
     MACRO_CANDIDATES,
     compute_macro_candidates,
     discover_regime_separator_cmi,
@@ -165,107 +167,15 @@ _FILTERED_COLS = {
 # ---------------------------------------------------------------------------
 
 
-def _fold_portfolio_perf(train_data: pd.DataFrame,
-                         y_pred: np.ndarray,
-                         quantile: float,
-                         beta_col: str = None) -> dict:
-    """
-    In-sample portfolio Sharpe and total return for one fold.
-    Uses rank-proportional top/bottom-quantile weights on y_raw (plain return),
-    matching the OOS weight construction logic.
-
-    If beta_col is provided, predictions are cross-sectionally beta-neutralized
-    per date (OLS residualization) before ranking — matching OOS neutralize_scores.
-    """
-    df = train_data.copy()
-    df["_pred"] = y_pred
-
-    daily_rets = {}
-    for ts, grp in df.groupby("ts"):
-        grp = grp.dropna(subset=["y_raw"])
-        n_assets = len(grp)
-        if n_assets < 4:
-            continue
-
-        # Beta-neutralize predictions to match OOS neutralize_scores
-        if beta_col and beta_col in grp.columns:
-            pred = grp["_pred"].copy()
-            beta = grp[beta_col]
-            valid = pred.notna() & beta.notna() & ~np.isinf(pred) & ~np.isinf(beta)
-            if valid.sum() >= 3 and np.var(beta[valid].values) > 1e-8:
-                slope, intercept = np.polyfit(
-                    beta[valid].values, pred[valid].values, 1)
-                pred[valid] = pred[valid] - (slope * beta[valid] + intercept)
-            grp = grp.copy()
-            grp["_pred"] = pred
-
-        int_ranks = grp["_pred"].rank(method="first")   # 1 = lowest score
-        long_m = int_ranks > (n_assets * (1 - quantile))
-        short_m = int_ranks <= (n_assets * quantile)
-        if long_m.sum() == 0 or short_m.sum() == 0:
-            continue
-
-        long_rank_scores = int_ranks[long_m]
-        long_w = (long_rank_scores / long_rank_scores.sum()) * 0.5
-
-        short_rank_scores = (n_assets + 1 - int_ranks[short_m])
-        short_w = (short_rank_scores / short_rank_scores.sum()) * 0.5
-
-        w = pd.Series(0.0, index=grp.index)
-        w[long_m] = long_w.values
-        w[short_m] = -short_w.values
-        daily_rets[ts] = float((w * grp["y_raw"]).sum())
-
-    if len(daily_rets) < 5:
-        return {"sharpe": np.nan, "total_return": np.nan, "n_days": len(daily_rets),
-                "daily_rets": daily_rets}
-
-    rets = pd.Series(daily_rets)
-    sharpe = float(rets.mean() / (rets.std() + 1e-12) * np.sqrt(252))
-    total_ret = float((1 + rets).prod() - 1)
-    return {"sharpe": sharpe, "total_return": total_ret, "n_days": len(rets),
-            "daily_rets": daily_rets}
-
-
-def _embargo_gap(n_train_dates: int, target_horizon: int, embargo_pct: float) -> int:
-    """
-    Periods to skip between train end and prediction date.
-    At minimum target_horizon; embargo_pct adds a fractional buffer to guard
-    against leakage from overlapping multi-day labels.
-    """
-    return max(target_horizon, int(n_train_dates * embargo_pct))
-
-
-def _block_bootstrap_counts(
-    n_dates: int, block_size: int, n_blocks: int,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """
-    Block bootstrap with REPLACEMENT — returns per-date counts.
-
-    Samples `n_blocks` consecutive blocks of length `block_size` from
-    [0, n_dates), with replacement. A given date can appear in multiple
-    blocks; this function tallies how many blocks cover each date and
-    returns the count vector (length n_dates, dtype int16).
-
-    This is the canonical block bootstrap: duplicates ARE preserved, so
-    each bag's effective sample size equals `n_dates` (with repeats),
-    and the out-of-bag fraction follows the standard 1 − 1/e ≈ 37% law,
-    giving real variance reduction on averaging. Returning unique indices
-    (the previous behaviour) collapsed each bag back toward the full
-    training set and killed the variance-reduction benefit.
-
-    All sampling is strictly within [0, n_dates) — no peeking forward.
-    """
-    if block_size <= 0 or n_dates <= block_size:
-        return np.ones(n_dates, dtype=np.int16)
-    counts = np.zeros(n_dates, dtype=np.int16)
-    max_start = n_dates - block_size
-    starts = rng.integers(0, max_start + 1, size=n_blocks)
-    for s in starts:
-        end = min(s + block_size, n_dates)
-        counts[s:end] += 1
-    return counts
+# Phase-4a refactor: pure helpers lifted to src/alpha/ebm_utils.py.
+# Re-exports keep every existing call site (including external imports of
+# `src.scripts.train_ebm_signal._fold_portfolio_perf` etc.) working.
+from ...alpha.ebm_utils import (  # noqa: E402,F401
+    _fold_portfolio_perf,
+    _embargo_gap,
+    _block_bootstrap_counts,
+    _ensemble_importances,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -273,98 +183,8 @@ def _block_bootstrap_counts(
 # ---------------------------------------------------------------------------
 
 
-class RegimeSelector:
-    """
-    Maps each prediction date to a discrete regime label using:
-      1. Ex-ante lag  : regime at time t is derived from the value at t-1,
-                        eliminating any look-ahead bias at prediction time.
-      2. Hysteresis   : the active label only switches after the new regime
-                        has been observed for `hysteresis` consecutive periods,
-                        reducing expert-switching turnover.
-
-    Parameters
-    ----------
-    panel       : full factor panel (must contain `ts` and `regime_col`).
-    regime_col  : name of the numeric regime column (e.g. volatility_regime_enc).
-    hysteresis  : minimum consecutive days in the new regime before switching.
-    """
-
-    def __init__(
-        self,
-        panel: pd.DataFrame,
-        regime_col: str,
-        hysteresis: int = 3,
-    ):
-        self.regime_col = regime_col
-        self.hysteresis = hysteresis
-
-        # Market-wide — same value for all symbols on a date, so .first() is fine.
-        dates = sorted(panel["ts"].unique())
-        raw_regime = (
-            panel.groupby("ts")[regime_col]
-            .first()
-            .reindex(dates)
-        )
-
-        # Store as string keys to avoid float-comparison issues (0.0 vs 0).
-        raw_str = raw_regime.apply(
-            lambda v: str(int(v)) if pd.notna(v) else "nan"
-        )
-
-        # Build the raw lookup (no lag) for use during IS expert training.
-        self._raw_map: dict = dict(zip(dates, raw_str.values))
-
-        # Build lagged + hysteresis-smoothed map for OOS expert selection.
-        lagged = raw_str.shift(1)  # NaN for the very first date
-
-        active: str | None = None
-        pending: str | None = None
-        pending_count: int = 0
-        smoothed: dict = {}
-
-        for date in dates:
-            raw_val = lagged.get(date)
-            is_nan = (raw_val is None) or (
-                raw_val == "nan") or pd.isna(raw_val)
-
-            if is_nan:
-                smoothed[date] = active  # None until data arrives
-                continue
-
-            if active is None:
-                active = raw_val
-                pending = None
-                pending_count = 0
-            elif raw_val == active:
-                pending = None
-                pending_count = 0
-            elif raw_val == pending:
-                pending_count += 1
-                if pending_count >= hysteresis:
-                    active = pending
-                    pending = None
-                    pending_count = 0
-            else:
-                pending = raw_val
-                pending_count = 1
-
-            smoothed[date] = active
-
-        self._smoothed_map: dict = smoothed
-
-    def get_regime(self, ts) -> str | None:
-        """
-        Returns the active (lagged + hysteresis-smoothed) regime for
-        OOS prediction at time `ts`.  None if not enough history yet.
-        """
-        return self._smoothed_map.get(ts)
-
-    def get_raw_regime(self, ts) -> str | None:
-        """
-        Returns the actual (non-lagged) regime at time `ts`.
-        Use this for in-sample expert training only.
-        """
-        return self._raw_map.get(ts)
+# Phase-4a refactor: RegimeSelector lifted to src/alpha/moe.py.
+from ...alpha.moe import RegimeSelector  # noqa: E402,F401
 
 
 # ResidualMoE lives in src.alpha.residual_moe so loky workers can pickle
@@ -372,7 +192,15 @@ class RegimeSelector:
 # `python -m src.scripts.train_ebm_signal` registered it under __main__,
 # and worker processes (which re-import the module under its real path)
 # couldn't resolve __main__.ResidualMoE → PicklingError.
-from ..alpha.residual_moe import ResidualMoE  # noqa: E402
+from ...alpha.residual_moe import ResidualMoE  # noqa: E402
+# Phase-4b refactor: bag-matrix construction + ensemble training. The
+# imports are aliased so the thin closure wrappers inside walk_forward
+# (which keep the legacy `_make_temporal_bags` / `_train_ebm_ensemble`
+# names) don't shadow the module-level versions.
+from ...alpha.bagging import (  # noqa: E402
+    make_temporal_bags as _bagging_make_temporal_bags,
+    train_ebm_ensemble as _bagging_train_ebm_ensemble,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -516,186 +344,51 @@ def walk_forward(
         """Average predictions across all models in the ensemble."""
         return np.mean([m.predict(X) for m in models], axis=0)
 
+    # Phase-4b refactor: both helpers lifted to src/alpha/bagging.py with
+    # their closure variables (block_size, target_horizon, rng,
+    # use_block_bagging, n_outer_bags, bag_symbol_frac,
+    # bag_sym_excluded_as_val) promoted to explicit keyword-only params.
+    # Thin local wrappers below preserve the original signatures so every
+    # interior call site inside walk_forward stays unchanged.
     def _make_temporal_bags(
         n: int, n_bags: int, use_blocks: bool,
-        date_arr: np.ndarray | None = None,
-        symbol_arr: np.ndarray | None = None,
+        date_arr: "np.ndarray | None" = None,
+        symbol_arr: "np.ndarray | None" = None,
         symbol_frac: float = 1.0,
         sym_excluded_as_val: bool = False,
     ) -> np.ndarray:
-        """Build a (n_samples × n_bags) bags matrix with temporal validation.
-
-        Returns an int16 matrix where each entry is:
-          k > 0 : row is in this bag's training set, sampled k times
-                  (block-bootstrap-with-replacement count for the row's date,
-                  zero-ed if the row's symbol is not in the bag's symbol subset)
-          -1    : row is in this bag's validation holdout (last val_dates,
-                  identical across bags for early-stopping consistency).
-                  When `sym_excluded_as_val=True` the symbols this bag
-                  dropped via subsampling ALSO join the validation set
-                  (per-bag, so each bag has a different val population) —
-                  blends temporal and cross-sectional generalization into
-                  the early-stopping signal. Default False keeps the
-                  legacy "pure temporal val" semantics.
-           0    : row is excluded from this bag
-
-        Diversity sources (all leak-free — sampling never touches the
-        validation tail or any post-pred-date data):
-
-          1. TIME diversity — block bootstrap WITH duplicates: each bag
-             samples ~train_dates / block_size blocks of consecutive dates,
-             with replacement. Counts > 1 are real (the canonical bootstrap
-             effect), giving each bag ~63% unique training dates.
-          2. CROSS-SECTIONAL diversity — when symbol_frac < 1.0, each bag
-             keeps a random subset of symbols (without replacement). Other
-             symbols are zeroed out for that bag. Bag-to-bag the symbol
-             subsets differ, so each bag's CS panel is decorrelated.
-
-        Validation rows are NEVER touched by either sampler — they remain
-        -1 across all bags, and date sampling is restricted to the
-        [0, train_date_cutoff) range.
-        """
-        if use_blocks and date_arr is not None:
-            unique_dates = np.unique(date_arr)
-            n_dates = len(unique_dates)
-            date_to_idx = {d: i for i, d in enumerate(unique_dates)}
-            row_date_idx = np.array([date_to_idx[d] for d in date_arr])
-
-            # Validation: last 20% of training dates (early-stopping holdout)
-            val_dates = int(n_dates * 0.1)
-            train_date_cutoff = n_dates - val_dates
-            train_row_mask = row_date_idx < train_date_cutoff
-
-            # Per-bag block count: aim for ~1× coverage of training dates,
-            # producing canonical bootstrap behaviour (~63% unique).
-            n_blocks_per_bag = max(
-                1, int(np.ceil(train_date_cutoff / block_size)))
-
-            # CS subsample setup
-            do_sym_sub = (symbol_arr is not None) and (symbol_frac < 1.0)
-            if do_sym_sub:
-                unique_syms = np.unique(symbol_arr)
-                n_syms = len(unique_syms)
-                sym_to_idx = {s: i for i, s in enumerate(unique_syms)}
-                row_sym_idx = np.array([sym_to_idx[s] for s in symbol_arr])
-                keep_size = max(1, int(n_syms * symbol_frac))
-
-            mat = np.zeros((n, n_bags), dtype=np.int16)
-            mat[~train_row_mask, :] = -1  # validation rows pinned across bags
-
-            for b in range(n_bags):
-                # 1) TIME: sample blocks with replacement → per-date counts.
-                #    Strictly within [0, train_date_cutoff) — no future leak.
-                #    Pad to full date length so indexing by row_date_idx is
-                #    safe for validation rows (their counts are zero anyway).
-                tr_counts = _block_bootstrap_counts(
-                    train_date_cutoff, block_size, n_blocks_per_bag, rng)
-                date_counts = np.zeros(n_dates, dtype=np.int16)
-                date_counts[:train_date_cutoff] = tr_counts
-                row_counts = date_counts[row_date_idx]  # safe broadcast
-
-                # 2) CS: optional per-bag symbol subsample
-                if do_sym_sub:
-                    keep_idx = rng.choice(
-                        n_syms, size=keep_size, replace=False)
-                    sym_keep_mask = np.zeros(n_syms, dtype=bool)
-                    sym_keep_mask[keep_idx] = True
-                    sym_active = sym_keep_mask[row_sym_idx]
-                else:
-                    sym_active = np.ones(n, dtype=bool)
-
-                # 3) Combine: training rows that are in selected dates AND
-                #    selected symbols receive their date count; others 0.
-                bag_col = np.where(
-                    train_row_mask & sym_active & (row_counts > 0),
-                    row_counts, 0,
-                ).astype(np.int16)
-                # Opt-in: symbol-excluded training rows join this bag's
-                # validation set instead of being skipped. Done BEFORE the
-                # time-based pin so the time-based -1 takes precedence on
-                # the validation tail (where sym subsampling is irrelevant).
-                if sym_excluded_as_val and do_sym_sub:
-                    sym_excluded_train = (
-                        train_row_mask & ~sym_active)
-                    bag_col[sym_excluded_train] = -1
-                # Restore validation pin for this column (always -1)
-                bag_col[~train_row_mask] = -1
-                mat[:, b] = bag_col
-            return mat
-        else:
-
-            if date_arr is not None:
-                unique_dates = np.unique(date_arr)
-                n_dates = len(unique_dates)
-                date_to_idx = {d: i for i, d in enumerate(unique_dates)}
-                row_date_idx = np.array([date_to_idx[d] for d in date_arr])
-                # val_dates = min(max(target_horizon, block_size),
-                #                 int(n_dates * 0.2))
-                val_dates = int(n_dates * 0.2)
-                train_date_cutoff = n_dates - val_dates
-                train_row_mask = row_date_idx < train_date_cutoff
-                # breakpoint()
-            else:
-                val_size = min(max(target_horizon, block_size), n // 5)
-                train_row_mask = np.ones(n, dtype=bool)
-                train_row_mask[n - val_size:] = False
-                raise ValueError(
-                    "_make_temporal_bags requires date_arr to compute a "
-                    "temporally correct validation split. Passing date_arr=None "
-                    "risks look-forward bias if rows are not sorted by date."
-                )
-
-            mat = np.zeros((n, n_bags), dtype=np.int8)
-            mat[train_row_mask, :] = 1
-            mat[~train_row_mask, :] = -1
-            return mat
+        return _bagging_make_temporal_bags(
+            n, n_bags, use_blocks,
+            date_arr=date_arr, symbol_arr=symbol_arr,
+            symbol_frac=symbol_frac,
+            sym_excluded_as_val=sym_excluded_as_val,
+            block_size=block_size,
+            target_horizon=target_horizon,
+            rng=rng,
+        )
 
     def _train_ebm_ensemble(
         X: np.ndarray, y: np.ndarray, kwargs: dict,
-        date_arr: np.ndarray | None = None,
-        symbol_arr: np.ndarray | None = None,
+        date_arr: "np.ndarray | None" = None,
+        symbol_arr: "np.ndarray | None" = None,
         force_no_bagging: bool = False,
     ) -> list:
-        """Train a single or block-bagged EBM ensemble. Returns list of models.
+        return _bagging_train_ebm_ensemble(
+            X, y, kwargs,
+            date_arr=date_arr, symbol_arr=symbol_arr,
+            force_no_bagging=force_no_bagging,
+            use_block_bagging=use_block_bagging,
+            n_outer_bags=n_outer_bags,
+            block_size=block_size,
+            bag_symbol_frac=bag_symbol_frac,
+            bag_sym_excluded_as_val=bag_sym_excluded_as_val,
+            target_horizon=target_horizon,
+            rng=rng,
+        )
 
-        Block-bagging uses a manual bags matrix with two leak-free diversity
-        sources: (1) block bootstrap WITH replacement on training-window dates
-        (per-date counts, ~63% unique → real variance reduction), and (2)
-        per-bag symbol subsampling when bag_symbol_frac < 1.0.
-
-        Non-block-bagging (or force_no_bagging=True) fits a plain EBM on the
-        full training set.  Expert models pass force_no_bagging=True because
-        their per-regime subsets are already small and external bagging would
-        shrink effective training history too aggressively.
-        """
-        n = len(X)
-        if use_block_bagging and not force_no_bagging:
-            bags_matrix = _make_temporal_bags(
-                n, n_outer_bags, use_blocks=True,
-                date_arr=date_arr, symbol_arr=symbol_arr,
-                symbol_frac=bag_symbol_frac,
-                sym_excluded_as_val=bag_sym_excluded_as_val,
-            )
-            kwargs_bag = {**kwargs, "outer_bags": n_outer_bags}
-            m = ExplainableBoostingRegressor(**kwargs_bag)
-            m.fit(X, y, bags=bags_matrix)
-            return [m]
-        else:
-            n_bags = kwargs.get("outer_bags", 8)
-            bags_matrix = _make_temporal_bags(
-                n, n_bags, use_blocks=False, date_arr=date_arr)
-            kwargs_fixed = {**kwargs, "outer_bags": n_bags}
-            m = ExplainableBoostingRegressor(**kwargs_fixed)
-            m.fit(X, y, bags=bags_matrix)
-            return [m]
-
-    def _ensemble_importances(model_list: list) -> pd.Series:
-        """Average term importances across a list of EBM models."""
-        imp = [
-            pd.Series(m.term_importances(), index=list(m.term_names_))
-            for m in model_list
-        ]
-        return pd.concat(imp, axis=1).mean(axis=1)
+    # Phase-4a refactor: _ensemble_importances is now provided by
+    # src/alpha/ebm_utils.py (imported at module top). The previous nested
+    # definition was byte-identical and has been removed.
 
     for pred_idx in range(pred_start_idx, label_cutoff_idx):
         pred_date = dates[pred_idx]
@@ -1108,10 +801,10 @@ def walk_forward_ho_moe(
         m.fit(X, y, bags=bags_matrix)
         return [m]
 
-    def _ensemble_importances(model_list: list) -> pd.Series:
-        imps = [pd.Series(m.term_importances(), index=list(m.term_names_))
-                for m in model_list]
-        return pd.concat(imps, axis=1).mean(axis=1)
+    # Phase-4a refactor: _ensemble_importances is now provided by
+    # src/alpha/ebm_utils.py (imported at module top). The previous nested
+    # definition was byte-equivalent (only the local-variable name `imps`
+    # differed) and has been removed.
 
     _first_train_logged = False
 
@@ -2044,13 +1737,13 @@ def main():
     # walk-forward ranking always operate over a consistent symbol set.
     # Full temporal history is kept per symbol for TS lookback warmup.
     # Without rolling universe (or --no_rolling_universe): single global pass.
-    ru_epochs = []
-    if not args.no_rolling_universe:
-        ru = RollingUniverse()
-        if not ru.is_empty():
-            start_str = panel["ts"].min().strftime("%Y-%m-%d")
-            end_str = panel["ts"].max().strftime("%Y-%m-%d")
-            ru_epochs = ru.get_epochs(start_str, end_str)
+    # Phase-2 refactor: use the shared preamble helper. Note this caller
+    # derives the window from the panel itself rather than CLI args; same
+    # semantics either way since resolve_epochs only consults start/end.
+    ru_epochs = resolve_epochs(
+        panel["ts"].min().strftime("%Y-%m-%d"),
+        panel["ts"].max().strftime("%Y-%m-%d"),
+        no_rolling_universe=args.no_rolling_universe) or []
 
     # HO-MoE only — populated by the per-fold CMI tournament and the per-
     # OOS-date regime gater. Default None so the CSV save blocks below work

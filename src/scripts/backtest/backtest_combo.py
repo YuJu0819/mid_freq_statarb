@@ -7,523 +7,50 @@ import matplotlib.gridspec as gridspec
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from ..core.utils import load_config, ensure_dir
-from ..data.binance_futures_rest import fetch_futures_klines
-from ..data.rolling_universe import RollingUniverse, build_symbol_active_mask
-from ..data.storage import parquet_path, load_bars, save_bars
-from ..backtest.engine import probabilistic_sharpe_ratio
-from ..backtest.reporting import plot_equity_curve
-from ..portfolio.optimizer import PortfolioOptimizer
+from ...core.utils import load_config, ensure_dir
+from ...data.binance_futures_rest import fetch_futures_klines
+from ...data.rolling_universe import (
+    RollingUniverse, build_symbol_active_mask, resolve_epochs,
+)
+from ...data.storage import parquet_path, load_bars, save_bars
+from ...backtest.engine import probabilistic_sharpe_ratio
+from ...backtest.reporting import plot_equity_curve
+from ...portfolio.optimizer import PortfolioOptimizer
 
 
-# Files saved by the backtest engine and train_ebm_signal that are NOT
-# strategy weight matrices (exclude these from auto-discovery).
-_EXCLUDE_PREFIXES = ("optimized_weights_",)
-_EXCLUDE_EXACT    = {"ebm_predictions.parquet"}
+# Phase-3 refactor: strategy parquet discovery + alignment lifted to
+# src/portfolio/strategy_loader.py. Re-exports keep external callers
+# (e.g. ad-hoc analysis notebooks) working through the old path.
+from ...portfolio.strategy_loader import (  # noqa: E402,F401
+    load_and_align_strategies,
+    EXCLUDE_PREFIXES as _EXCLUDE_PREFIXES,
+    EXCLUDE_EXACT as _EXCLUDE_EXACT,
+)
 
 
-def load_and_align_strategies(run_dir: str,
-                               strategies: list[str] | None = None):
-    """
-    Loads strategy weight parquets from run_dir and aligns them to a master
-    timeline.
+# Phase-5 refactor: cache-first price loader lifted to src/data/prices.py.
+from ...data.prices import fetch_all_prices  # noqa: E402,F401
 
-    Parameters
-    ----------
-    run_dir    : directory containing *.parquet weight files
-    strategies : explicit list of base names (e.g. ["momentum","reversal","ebm"]).
-                 If None, all *.parquet files are auto-discovered (excluding
-                 optimized_weights_* and ebm_predictions.parquet).
-    """
-    if strategies:
-        files = []
-        for name in strategies:
-            p = os.path.join(run_dir, f"{name}.parquet")
-            if not os.path.exists(p):
-                print(f"  [warn] {p} not found — skipping '{name}'.")
-            else:
-                files.append(p)
-    else:
-        all_files = glob.glob(os.path.join(run_dir, "*.parquet"))
-        files = [
-            f for f in all_files
-            if os.path.basename(f) not in _EXCLUDE_EXACT
-            and not any(os.path.basename(f).startswith(pfx)
-                        for pfx in _EXCLUDE_PREFIXES)
-        ]
-
-    if not files:
-        raise FileNotFoundError(f"No weight files found in {run_dir}")
-
-    print(
-        f"Found {len(files)} strategies: {[os.path.basename(f) for f in files]}")
-
-    raw_strategies = {}
-    for f in files:
-        name = os.path.basename(f).replace(".parquet", "")
-        df = pd.read_parquet(f)
-        if not pd.api.types.is_datetime64_any_dtype(df.index):
-            df.index = pd.to_datetime(df.index)
-        raw_strategies[name] = df
-
-    # Create Union Index/Columns
-    master_ts = pd.Index([])
-    master_cols = pd.Index([])
-    for df in raw_strategies.values():
-        master_ts = master_ts.union(df.index)
-        master_cols = master_cols.union(df.columns)
-
-    master_ts = master_ts.sort_values().unique()
-    master_cols = master_cols.sort_values().unique()
-
-    # Align
-    aligned_strategies = {}
-    for name, df in raw_strategies.items():
-        aligned_df = df.reindex(
-            index=master_ts, columns=master_cols).fillna(0.0)
-        aligned_strategies[name] = aligned_df
-
-    return aligned_strategies, master_ts, master_cols
+# Phase-1 refactor: this helper was lifted verbatim to src/data/cache.py.
+# Re-export keeps existing call sites (including external test imports of
+# `src.scripts.backtest_combo._load_symbol_close_cached`) working.
+from ...data.cache import _load_symbol_close_cached  # noqa: E402,F401
 
 
-def fetch_all_prices(symbols, start_date, end_date,
-                     parquet_dir: str = "./cache/parquet"):
-    """
-    Loads prices for every symbol in the universe.
-
-    Cache-first strategy: looks for the per-symbol parquets that the rest of
-    the pipeline (backtest_reversal, train_ebm_signal, build_factor_panel)
-    already writes to `parquet_dir`. Only falls back to the Binance Futures
-    REST API for symbols missing from cache or whose cached range doesn't
-    cover the requested window.
-
-    Why this matters: without caching, combo re-fetches 200+ symbols on
-    every run, blowing through Binance's ~1200-weight-per-minute budget
-    (futures_klines = 5 weight × 268 syms ≈ 1340 weight in <60s) and
-    triggering the -1003 rate-limit cooldown loop.
-    """
-    print(f"Loading price history for {len(symbols)} assets "
-          f"(cache-first; API only for misses)...")
-    t0 = pd.Timestamp(start_date)
-    t1 = pd.Timestamp(end_date)
-
-    price_frames = {}
-    n_cache_hits = 0
-    n_api_fetches = 0
-    n_missing = 0
-    for sym in tqdm(symbols):
-        price = _load_symbol_close_cached(sym, t0, t1, parquet_dir)
-        if price is not None:
-            price_frames[sym] = price
-            n_cache_hits += 1
-            continue
-        # Cache miss → API. Falling through to fetch_futures_klines triggers
-        # the safe_api_call cooldown only when truly unavoidable.
-        try:
-            df = fetch_futures_klines(sym, "1d", start_date, end_date)
-            if df.empty:
-                n_missing += 1
-                continue
-            if not pd.api.types.is_datetime64_any_dtype(df['ts']):
-                df['ts'] = pd.to_datetime(df['ts'], unit='ms')
-            df = df.set_index('ts')
-            price = (df['futures_close'] if 'futures_close' in df.columns
-                     else df['close'])
-            # Persist for next run so subsequent combo invocations are
-            # cache-hits too. Use the same key convention as the loader.
-            try:
-                cache_path = parquet_path(
-                    parquet_dir, sym,
-                    f"1d_{start_date}_to_{end_date}_momentum")
-                # save_bars expects a frame with a 'ts' column, not an index.
-                to_save = pd.DataFrame({
-                    "ts": price.index, "futures_close": price.values})
-                save_bars(to_save, cache_path)
-            except Exception:
-                pass
-            price_frames[sym] = price
-            n_api_fetches += 1
-        except Exception as e:
-            print(f"Error fetching {sym}: {e}")
-            n_missing += 1
-
-    print(f"  cache hits  : {n_cache_hits}/{len(symbols)}")
-    print(f"  API fetches : {n_api_fetches}")
-    if n_missing:
-        print(f"  missing     : {n_missing} (no cache + API empty)")
-
-    if not price_frames:
-        return pd.DataFrame()
-    return pd.DataFrame(price_frames).ffill()
+# Phase-5 refactor: cross-signal MV machinery lifted to
+# src/portfolio/cross_signal_mv.py. Re-exports preserve every existing
+# call site (including external imports of these symbols).
+from ...portfolio.cross_signal_mv import (  # noqa: E402,F401
+    compute_strategy_returns,
+    _stable_cov,
+    optimize_signal_weights,
+)
 
 
-def _load_symbol_close_cached(sym: str,
-                              t0: pd.Timestamp,
-                              t1: pd.Timestamp,
-                              parquet_dir: str) -> pd.Series | None:
-    """
-    Find a cached parquet for `sym` whose date range covers [t0, t1].
-
-    The pipeline saves under several suffixes ('_momentum', plain interval,
-    etc.) and sometimes with date ranges that EXTEND the requested window.
-    We scan for any candidate file whose [min_ts, max_ts] envelopes
-    [t0, t1] and return the futures_close slice.
-    """
-    cache_root = os.path.join(parquet_dir, "parquet")
-    if not os.path.isdir(cache_root):
-        return None
-    candidates = glob.glob(os.path.join(cache_root, f"{sym}_1d_*.parquet"))
-    # Prefer files whose filename date-range envelopes [t0, t1] (avoids
-    # loading an irrelevant tiny slice). Fall back to scanning contents.
-    candidates.sort(key=os.path.getmtime, reverse=True)
-    for path in candidates:
-        try:
-            df = load_bars(path)
-        except Exception:
-            continue
-        if df is None or df.empty or "ts" not in df.columns:
-            continue
-        ts = pd.to_datetime(df["ts"])
-        if ts.min() > t0 or ts.max() < t1:
-            continue
-        col = "futures_close" if "futures_close" in df.columns else (
-            "close" if "close" in df.columns else None)
-        if col is None:
-            continue
-        price = pd.Series(df[col].values, index=ts, name=sym)
-        # Trim to the requested window — the cached range can be wider.
-        price = price[(price.index >= t0) & (price.index <= t1)]
-        if not price.empty:
-            return price
-    return None
-
-
-def compute_strategy_returns(
-    aligned_strategies: dict,
-    returns_df: pd.DataFrame,
-    all_ts: pd.Index,
-) -> pd.DataFrame:
-    """
-    Computes the daily portfolio return series for each strategy using
-    lagged weights — return on day t = weights posted at end-of-day t-1
-    dotted with asset returns on day t.
-
-    Returns a DataFrame of shape (n_dates, n_strategies).
-    """
-    common_cols = returns_df.columns
-    strat_rets = {}
-    for name, w_df in aligned_strategies.items():
-        w_aligned = w_df.reindex(index=all_ts, columns=common_cols).fillna(0.0)
-        lagged_w = w_aligned.shift(1).fillna(0.0)
-        r_aligned = returns_df.reindex(index=all_ts, columns=common_cols).fillna(0.0)
-        strat_rets[name] = (lagged_w * r_aligned).sum(axis=1)
-    return pd.DataFrame(strat_rets, index=all_ts)
-
-
-def _stable_cov(
-    rets: pd.DataFrame,
-    method: str = "ledoit_wolf",
-    shrinkage: float | None = None,
-) -> np.ndarray:
-    """
-    Covariance estimator with shrinkage toward a structured target.
-
-    With only 3 strategies and a ~30-day lookback the sample covariance
-    has ≈ 33 degrees of freedom for 6 off-diagonal entries — very noisy.
-    Shrinkage toward `var_mean · I` (Ledoit-Wolf target) or toward the
-    diagonal stabilises Σ and prevents the corner-solution flips we saw
-    on the unsmoothed λ.
-
-    method
-        "sample"      — no shrinkage (legacy behaviour)
-        "diagonal"    — zero off-diagonals (assumes strategies uncorrelated)
-        "ledoit_wolf" — shrink toward var_mean · I with optimal intensity
-
-    shrinkage : optional float ∈ [0, 1]
-        If provided, overrides the data-driven intensity. Only meaningful
-        for "ledoit_wolf" / "diagonal".
-    """
-    X = rets.values
-    n_samples, n_assets = X.shape
-    sample = np.cov(X, rowvar=False)
-    if n_assets <= 1:
-        return np.atleast_2d(sample)
-
-    if method == "sample":
-        return sample + np.eye(n_assets) * 1e-8
-
-    if method == "diagonal":
-        target = np.diag(np.diag(sample))
-        alpha = 0.5 if shrinkage is None else float(shrinkage)
-        return (1 - alpha) * sample + alpha * target + np.eye(n_assets) * 1e-8
-
-    # ledoit_wolf
-    if shrinkage is None:
-        try:
-            from sklearn.covariance import LedoitWolf
-            lw = LedoitWolf().fit(X)
-            return lw.covariance_ + np.eye(n_assets) * 1e-8
-        except ImportError:
-            # Manual fallback: scaled-identity shrinkage with a fixed alpha.
-            shrinkage = 0.3
-    # Manual LW target = var_mean · I, intensity = shrinkage
-    var_mean = float(np.trace(sample) / n_assets)
-    target = var_mean * np.eye(n_assets)
-    alpha = float(shrinkage)
-    return (1 - alpha) * sample + alpha * target + np.eye(n_assets) * 1e-8
-
-
-def optimize_signal_weights(
-    strat_ret_window: pd.DataFrame,
-    lambda_risk: float,
-    cov_method: str = "ledoit_wolf",
-    cov_shrinkage: float | None = None,
-) -> pd.Series:
-    """
-    Mean-variance optimization in strategy space.
-
-    Maximises: μᵀλ − lambda_risk · λᵀΣλ
-    Subject to: λ ≥ 0,  sum(λ) = 1
-
-    μ = mean daily return per strategy over the lookback window.
-    Σ = covariance of daily strategy returns (estimator controlled by
-        cov_method — defaults to Ledoit-Wolf shrinkage for stability
-        with the small strategy count).
-
-    Falls back to equal weights on solver failure or insufficient data.
-    """
-    names = strat_ret_window.columns.tolist()
-    n = len(names)
-
-    if n == 1:
-        return pd.Series(1.0, index=names)
-
-    mu = strat_ret_window.mean().values
-    Sigma = _stable_cov(strat_ret_window, method=cov_method,
-                        shrinkage=cov_shrinkage)
-
-    lam = cp.Variable(n)
-    objective = cp.Maximize(
-        mu @ lam - lambda_risk * cp.quad_form(lam, cp.psd_wrap(Sigma))
-    )
-    constraints = [lam >= 0, cp.sum(lam) == 1]
-
-    try:
-        cp.Problem(objective, constraints).solve()
-        if lam.value is None:
-            return pd.Series(1.0 / n, index=names)
-        result = pd.Series(lam.value, index=names).clip(lower=0)
-        total = result.sum()
-        return result / total if total > 1e-8 else pd.Series(1.0 / n, index=names)
-    except Exception:
-        return pd.Series(1.0 / n, index=names)
-
-
-def analyze_weight_distribution(
-    final_weights: pd.DataFrame,
-    method: str,
-    base_dir: str,
-    signal_weights_history: dict | None = None,
-):
-    """
-    Generates weight distribution analysis for the optimized portfolio.
-
-    Outputs
-    -------
-    weight_stats_daily_{method}.csv   per-date portfolio metrics
-    weight_stats_assets_{method}.csv  per-asset average weight statistics
-    weight_distribution_{method}.png  6-panel (or 7-panel for cross_signal_mv) figure
-    """
-    import warnings
-    warnings.filterwarnings("ignore")
-
-    w = final_weights.copy()
-    active = w[w.abs().sum(axis=1) > 1e-8]   # dates with at least one position
-
-    # ── Per-date stats ────────────────────────────────────────────────────────
-    daily = pd.DataFrame(index=active.index)
-    daily["gross_leverage"]  = active.abs().sum(axis=1)
-    daily["net_exposure"]    = active.sum(axis=1)
-    daily["n_long"]          = (active > 1e-6).sum(axis=1)
-    daily["n_short"]         = (active < -1e-6).sum(axis=1)
-    # Effective N = 1 / HHI — inverse of Herfindahl concentration index
-    sq_sum = (active ** 2).sum(axis=1)
-    daily["effective_n"]     = (1.0 / sq_sum.replace(0, np.nan)).fillna(0)
-    # Daily turnover = sum of |Δweight|
-    daily["turnover"]        = w.diff().abs().sum(axis=1)
-
-    daily_path = os.path.join(base_dir, f"weight_stats_daily_{method}.csv")
-    daily.to_csv(daily_path)
-    print(f"Daily weight stats saved → {daily_path}")
-
-    # ── Per-asset stats ───────────────────────────────────────────────────────
-    long_w  = active.clip(lower=0).replace(0, np.nan)
-    short_w = active.clip(upper=0).replace(0, np.nan).abs()
-
-    asset_stats = pd.DataFrame({
-        "avg_long_weight":  long_w.mean(),
-        "avg_short_weight": short_w.mean(),
-        "long_days":        (active > 1e-6).sum(),
-        "short_days":       (active < -1e-6).sum(),
-        "long_freq":        (active > 1e-6).mean(),
-        "short_freq":       (active < -1e-6).mean(),
-        "avg_abs_weight":   active.abs().replace(0, np.nan).mean(),
-    }).dropna(how="all").sort_values("avg_abs_weight", ascending=False)
-
-    asset_path = os.path.join(base_dir, f"weight_stats_assets_{method}.csv")
-    asset_stats.to_csv(asset_path)
-    print(f"Asset weight stats saved  → {asset_path}")
-
-    # ── Figure ────────────────────────────────────────────────────────────────
-    has_signal_hist = bool(signal_weights_history)
-    n_rows = 4 if not has_signal_hist else 5
-    fig = plt.figure(figsize=(16, 4.5 * n_rows))
-    gs  = gridspec.GridSpec(n_rows, 2, figure=fig, hspace=0.50, wspace=0.35)
-
-    # 1. Gross leverage + net exposure (full width)
-    ax1 = fig.add_subplot(gs[0, :])
-    ax1.fill_between(daily.index, daily["gross_leverage"],
-                     alpha=0.25, color="#2196F3", label="Gross Leverage")
-    ax1.plot(daily.index, daily["gross_leverage"],
-             color="#2196F3", lw=1.2, label="_nolegend_")
-    ax1b = ax1.twinx()
-    ax1b.plot(daily.index, daily["net_exposure"],
-              color="#FF5722", lw=1.0, linestyle="--", label="Net Exposure")
-    ax1b.axhline(0, color="gray", lw=0.5, linestyle=":")
-    ax1.set_ylabel("Gross Leverage", color="#2196F3")
-    ax1b.set_ylabel("Net Exposure", color="#FF5722")
-    ax1.set_title(
-        f"Gross Leverage & Net Exposure  |  "
-        f"avg gross={daily['gross_leverage'].mean():.3f}  "
-        f"avg net={daily['net_exposure'].mean():.3f}"
-    )
-    lines1, labs1 = ax1.get_legend_handles_labels()
-    lines2, labs2 = ax1b.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labs1 + labs2, fontsize=8)
-    ax1.tick_params(axis="x", labelrotation=30, labelsize=8)
-
-    # 2. Long / short count  (left)
-    ax2 = fig.add_subplot(gs[1, 0])
-    ax2.plot(daily.index, daily["n_long"],
-             color="#4CAF50", lw=1.2, label="N Long")
-    ax2.plot(daily.index, daily["n_short"],
-             color="#F44336", lw=1.2, label="N Short")
-    ax2.set_ylabel("Asset Count")
-    ax2.set_title(
-        f"Long / Short Asset Counts  |  "
-        f"avg long={daily['n_long'].mean():.1f}  "
-        f"avg short={daily['n_short'].mean():.1f}"
-    )
-    ax2.legend(fontsize=8)
-    ax2.tick_params(axis="x", labelrotation=30, labelsize=8)
-
-    # 3. Effective N & daily turnover  (right)
-    ax3 = fig.add_subplot(gs[1, 1])
-    ax3.plot(daily.index, daily["effective_n"],
-             color="#9C27B0", lw=1.2, label="Effective N")
-    ax3b = ax3.twinx()
-    ax3b.plot(daily.index, daily["turnover"].rolling(5).mean(),
-              color="#FF9800", lw=1.0, linestyle="--",
-              label="5d avg Turnover")
-    ax3.set_ylabel("Effective N (1/HHI)", color="#9C27B0")
-    ax3b.set_ylabel("Turnover (|Δw|)", color="#FF9800")
-    ax3.set_title(
-        f"Diversification & Turnover  |  "
-        f"avg eff_N={daily['effective_n'].mean():.1f}  "
-        f"avg turnover={daily['turnover'].mean():.3f}"
-    )
-    lines_a, labs_a = ax3.get_legend_handles_labels()
-    lines_b, labs_b = ax3b.get_legend_handles_labels()
-    ax3.legend(lines_a + lines_b, labs_a + labs_b, fontsize=8)
-    ax3.tick_params(axis="x", labelrotation=30, labelsize=8)
-
-    # 4. Weight magnitude histogram — longs vs shorts  (left)
-    ax4 = fig.add_subplot(gs[2, 0])
-    all_longs  = active.values[active.values >  1e-6].flatten()
-    all_shorts = active.values[active.values < -1e-6].flatten()
-    bins = np.linspace(0, active.abs().max().max() * 1.05, 40)
-    ax4.hist(all_longs,   bins=bins, color="#4CAF50", alpha=0.65, label="Long weights")
-    ax4.hist(all_shorts * -1, bins=bins, color="#F44336", alpha=0.65, label="Short weights")
-    ax4.set_xlabel("|Weight|")
-    ax4.set_ylabel("Frequency")
-    ax4.set_title("Weight Magnitude Distribution")
-    ax4.legend(fontsize=8)
-    ax4.axvline(np.mean(np.abs(all_longs))  if len(all_longs)  else 0,
-                color="#2E7D32", lw=1.0, linestyle="--", label="_nolegend_")
-    ax4.axvline(np.mean(np.abs(all_shorts)) if len(all_shorts) else 0,
-                color="#B71C1C", lw=1.0, linestyle="--", label="_nolegend_")
-
-    # 5. Top 15 assets by avg |weight|  (right)
-    ax5 = fig.add_subplot(gs[2, 1])
-    top_assets = asset_stats["avg_abs_weight"].dropna().head(15).sort_values()
-    bar_c = []
-    for sym in top_assets.index:
-        lf = asset_stats.loc[sym, "long_freq"]
-        sf = asset_stats.loc[sym, "short_freq"]
-        bar_c.append("#4CAF50" if lf >= sf else "#F44336")
-    ax5.barh(top_assets.index, top_assets.values, color=bar_c, alpha=0.80)
-    ax5.set_xlabel("Avg |Weight|")
-    ax5.set_title("Top 15 Assets by Avg |Weight|\n(green = more often long, red = more often short)")
-    ax5.tick_params(axis="y", labelsize=7)
-
-    # 6. Long/short weight concentration over time — stacked bars  (full width)
-    ax6 = fig.add_subplot(gs[3, :])
-    roll_long  = (active.clip(lower=0)  > 1e-6).sum(axis=1).rolling(21).mean()
-    roll_short = (active.clip(upper=0) < -1e-6).sum(axis=1).rolling(21).mean()
-    ax6.stackplot(daily.index,
-                  [roll_long.reindex(daily.index).fillna(0),
-                   roll_short.reindex(daily.index).fillna(0)],
-                  labels=["21d avg N Long", "21d avg N Short"],
-                  colors=["#A5D6A7", "#EF9A9A"], alpha=0.85)
-    ax6.set_ylabel("Asset count (21d rolling avg)")
-    ax6.set_title("Portfolio Breadth Over Time")
-    ax6.legend(fontsize=8, loc="upper left")
-    ax6.tick_params(axis="x", labelrotation=30, labelsize=8)
-
-    # 7. Strategy λ weights over time — stacked area (cross_signal_mv only)
-    if has_signal_hist:
-        ax7 = fig.add_subplot(gs[4, :])
-        lam_df = pd.DataFrame(signal_weights_history).T.sort_index()
-        lam_df = lam_df.reindex(daily.index).ffill().fillna(0.0)
-
-        palette = ["#2196F3", "#FF9800", "#4CAF50",
-                   "#F44336", "#9C27B0", "#00BCD4", "#795548"]
-        colors7 = palette[:len(lam_df.columns)]
-        ax7.stackplot(lam_df.index,
-                      [lam_df[c].values for c in lam_df.columns],
-                      labels=lam_df.columns.tolist(),
-                      colors=colors7, alpha=0.80)
-        ax7.set_ylim(0, 1)
-        ax7.set_ylabel("Strategy weight λ")
-        ax7.set_title("Cross-Signal MV: Strategy Allocation Over Time")
-        ax7.legend(fontsize=8, loc="upper left")
-        ax7.tick_params(axis="x", labelrotation=30, labelsize=8)
-
-    fig.suptitle(
-        f"Weight Distribution Analysis  |  method={method}",
-        fontsize=13, fontweight="bold", y=1.01,
-    )
-    fig.tight_layout()
-    plot_path = os.path.join(base_dir, f"weight_distribution_{method}.png")
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Weight distribution plot saved → {plot_path}")
-
-    # ── Console summary ───────────────────────────────────────────────────────
-    sep = "─" * 50
-    print(f"\n{sep}")
-    print(f"  Weight Distribution Summary  ({method})")
-    print(sep)
-    print(f"  Active days       : {len(daily)} / {len(final_weights)}")
-    print(f"  Avg gross leverage: {daily['gross_leverage'].mean():.4f}")
-    print(f"  Avg net exposure  : {daily['net_exposure'].mean():.4f}")
-    print(f"  Avg N long        : {daily['n_long'].mean():.1f}")
-    print(f"  Avg N short       : {daily['n_short'].mean():.1f}")
-    print(f"  Avg effective N   : {daily['effective_n'].mean():.1f}")
-    print(f"  Avg daily turnover: {daily['turnover'].mean():.4f}")
-    print(f"  Max single weight : {active.values.max():.4f}")
-    print(f"  Min single weight : {active.values.min():.4f}")
-    print(sep)
+# Phase-5 refactor: analyze_weight_distribution lifted to
+# src/backtest/reporting.py (sits naturally with the other plotting
+# functions). Re-export shim keeps external callers working.
+from ...backtest.reporting import analyze_weight_distribution  # noqa: E402,F401
 
 
 def main():
@@ -643,22 +170,24 @@ def main():
     # 1b. Safety-net epoch mask — zero weights outside each symbol's active epoch.
     # Each individual strategy (momentum, reversal, ebm) already applies this mask
     # at generation time; this pass catches any future strategy that doesn't.
-    ru = RollingUniverse()
-    if not ru.is_empty():
-        ru_epochs = ru.get_epochs(args.start_date, args.end_date)
-        if ru_epochs:
-            print(f"Applying rolling universe epoch mask to loaded strategies "
-                  f"({len(ru_epochs)} epochs)...")
-            for name, df in strategies.items():
-                zeroed = 0
-                for sym in df.columns:
-                    ts_series = pd.Series(df.index, index=df.index)
-                    active = build_symbol_active_mask(sym, ts_series, ru_epochs)
-                    inactive = ~active.values
-                    if inactive.any():
-                        zeroed += int(inactive.sum())
-                        df.loc[inactive, sym] = 0.0
-                print(f"  {name}: zeroed {zeroed:,} inactive (date, symbol) entries.")
+    # Phase-2 refactor: only the preamble is shared with other scripts;
+    # the in-place mask of wide weight matrices is structurally distinct
+    # from the build-a-mask-DataFrame pattern in backtest_reversal/multi,
+    # so it stays local.
+    ru_epochs = resolve_epochs(args.start_date, args.end_date)
+    if ru_epochs:
+        print(f"Applying rolling universe epoch mask to loaded strategies "
+              f"({len(ru_epochs)} epochs)...")
+        for name, df in strategies.items():
+            zeroed = 0
+            for sym in df.columns:
+                ts_series = pd.Series(df.index, index=df.index)
+                active = build_symbol_active_mask(sym, ts_series, ru_epochs)
+                inactive = ~active.values
+                if inactive.any():
+                    zeroed += int(inactive.sum())
+                    df.loc[inactive, sym] = 0.0
+            print(f"  {name}: zeroed {zeroed:,} inactive (date, symbol) entries.")
 
     # 2. Fetch Market Data
     fetch_start = (pd.to_datetime(args.start_date) -

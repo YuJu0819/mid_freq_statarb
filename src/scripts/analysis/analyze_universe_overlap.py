@@ -19,7 +19,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
-from ..data.rolling_universe import RollingUniverse
+from ...data.rolling_universe import RollingUniverse
 
 _SNAPSHOTS_DIR = "./data/universe_snapshots"
 _REPORT_DIR = "./reports"

@@ -1,5 +1,6 @@
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec   # phase-5: analyze_weight_distribution
 import os
 import numpy as np
 
@@ -664,3 +665,218 @@ def analyze_pure_factor_quantiles(
     print(stats_df.to_string(index=False))
     print(f"   L/S  Ann={ls_ann:.2%}  Sharpe={ls_sharpe:.2f}")
     print("-" * 60)
+
+
+# ---------------------------------------------------------------------------
+# Phase-5 refactor: weight distribution analysis (combo backtest reporting)
+# ---------------------------------------------------------------------------
+# Lifted verbatim from src/scripts/backtest_combo.py. Generates the six-panel
+# (or seven-panel for cross_signal_mv) weight-distribution figure plus the
+# accompanying CSV summaries. backtest_combo.py keeps a re-export shim so
+# any external caller still sees the function under the old import path.
+
+def analyze_weight_distribution(
+    final_weights: pd.DataFrame,
+    method: str,
+    base_dir: str,
+    signal_weights_history: "dict | None" = None,
+):
+    """
+    Generates weight distribution analysis for the optimized portfolio.
+
+    Outputs
+    -------
+    weight_stats_daily_{method}.csv   per-date portfolio metrics
+    weight_stats_assets_{method}.csv  per-asset average weight statistics
+    weight_distribution_{method}.png  6-panel (or 7-panel for cross_signal_mv) figure
+    """
+    import warnings
+    warnings.filterwarnings("ignore")
+
+    w = final_weights.copy()
+    active = w[w.abs().sum(axis=1) > 1e-8]   # dates with at least one position
+
+    # ── Per-date stats ────────────────────────────────────────────────────────
+    daily = pd.DataFrame(index=active.index)
+    daily["gross_leverage"]  = active.abs().sum(axis=1)
+    daily["net_exposure"]    = active.sum(axis=1)
+    daily["n_long"]          = (active > 1e-6).sum(axis=1)
+    daily["n_short"]         = (active < -1e-6).sum(axis=1)
+    # Effective N = 1 / HHI — inverse of Herfindahl concentration index
+    sq_sum = (active ** 2).sum(axis=1)
+    daily["effective_n"]     = (1.0 / sq_sum.replace(0, np.nan)).fillna(0)
+    # Daily turnover = sum of |Δweight|
+    daily["turnover"]        = w.diff().abs().sum(axis=1)
+
+    daily_path = os.path.join(base_dir, f"weight_stats_daily_{method}.csv")
+    daily.to_csv(daily_path)
+    print(f"Daily weight stats saved → {daily_path}")
+
+    # ── Per-asset stats ───────────────────────────────────────────────────────
+    long_w  = active.clip(lower=0).replace(0, np.nan)
+    short_w = active.clip(upper=0).replace(0, np.nan).abs()
+
+    asset_stats = pd.DataFrame({
+        "avg_long_weight":  long_w.mean(),
+        "avg_short_weight": short_w.mean(),
+        "long_days":        (active > 1e-6).sum(),
+        "short_days":       (active < -1e-6).sum(),
+        "long_freq":        (active > 1e-6).mean(),
+        "short_freq":       (active < -1e-6).mean(),
+        "avg_abs_weight":   active.abs().replace(0, np.nan).mean(),
+    }).dropna(how="all").sort_values("avg_abs_weight", ascending=False)
+
+    asset_path = os.path.join(base_dir, f"weight_stats_assets_{method}.csv")
+    asset_stats.to_csv(asset_path)
+    print(f"Asset weight stats saved  → {asset_path}")
+
+    # ── Figure ────────────────────────────────────────────────────────────────
+    has_signal_hist = bool(signal_weights_history)
+    n_rows = 4 if not has_signal_hist else 5
+    fig = plt.figure(figsize=(16, 4.5 * n_rows))
+    gs  = gridspec.GridSpec(n_rows, 2, figure=fig, hspace=0.50, wspace=0.35)
+
+    # 1. Gross leverage + net exposure (full width)
+    ax1 = fig.add_subplot(gs[0, :])
+    ax1.fill_between(daily.index, daily["gross_leverage"],
+                     alpha=0.25, color="#2196F3", label="Gross Leverage")
+    ax1.plot(daily.index, daily["gross_leverage"],
+             color="#2196F3", lw=1.2, label="_nolegend_")
+    ax1b = ax1.twinx()
+    ax1b.plot(daily.index, daily["net_exposure"],
+              color="#FF5722", lw=1.0, linestyle="--", label="Net Exposure")
+    ax1b.axhline(0, color="gray", lw=0.5, linestyle=":")
+    ax1.set_ylabel("Gross Leverage", color="#2196F3")
+    ax1b.set_ylabel("Net Exposure", color="#FF5722")
+    ax1.set_title(
+        f"Gross Leverage & Net Exposure  |  "
+        f"avg gross={daily['gross_leverage'].mean():.3f}  "
+        f"avg net={daily['net_exposure'].mean():.3f}"
+    )
+    lines1, labs1 = ax1.get_legend_handles_labels()
+    lines2, labs2 = ax1b.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labs1 + labs2, fontsize=8)
+    ax1.tick_params(axis="x", labelrotation=30, labelsize=8)
+
+    # 2. Long / short count  (left)
+    ax2 = fig.add_subplot(gs[1, 0])
+    ax2.plot(daily.index, daily["n_long"],
+             color="#4CAF50", lw=1.2, label="N Long")
+    ax2.plot(daily.index, daily["n_short"],
+             color="#F44336", lw=1.2, label="N Short")
+    ax2.set_ylabel("Asset Count")
+    ax2.set_title(
+        f"Long / Short Asset Counts  |  "
+        f"avg long={daily['n_long'].mean():.1f}  "
+        f"avg short={daily['n_short'].mean():.1f}"
+    )
+    ax2.legend(fontsize=8)
+    ax2.tick_params(axis="x", labelrotation=30, labelsize=8)
+
+    # 3. Effective N & daily turnover  (right)
+    ax3 = fig.add_subplot(gs[1, 1])
+    ax3.plot(daily.index, daily["effective_n"],
+             color="#9C27B0", lw=1.2, label="Effective N")
+    ax3b = ax3.twinx()
+    ax3b.plot(daily.index, daily["turnover"].rolling(5).mean(),
+              color="#FF9800", lw=1.0, linestyle="--",
+              label="5d avg Turnover")
+    ax3.set_ylabel("Effective N (1/HHI)", color="#9C27B0")
+    ax3b.set_ylabel("Turnover (|Δw|)", color="#FF9800")
+    ax3.set_title(
+        f"Diversification & Turnover  |  "
+        f"avg eff_N={daily['effective_n'].mean():.1f}  "
+        f"avg turnover={daily['turnover'].mean():.3f}"
+    )
+    lines_a, labs_a = ax3.get_legend_handles_labels()
+    lines_b, labs_b = ax3b.get_legend_handles_labels()
+    ax3.legend(lines_a + lines_b, labs_a + labs_b, fontsize=8)
+    ax3.tick_params(axis="x", labelrotation=30, labelsize=8)
+
+    # 4. Weight magnitude histogram — longs vs shorts  (left)
+    ax4 = fig.add_subplot(gs[2, 0])
+    all_longs  = active.values[active.values >  1e-6].flatten()
+    all_shorts = active.values[active.values < -1e-6].flatten()
+    bins = np.linspace(0, active.abs().max().max() * 1.05, 40)
+    ax4.hist(all_longs,   bins=bins, color="#4CAF50", alpha=0.65, label="Long weights")
+    ax4.hist(all_shorts * -1, bins=bins, color="#F44336", alpha=0.65, label="Short weights")
+    ax4.set_xlabel("|Weight|")
+    ax4.set_ylabel("Frequency")
+    ax4.set_title("Weight Magnitude Distribution")
+    ax4.legend(fontsize=8)
+    ax4.axvline(np.mean(np.abs(all_longs))  if len(all_longs)  else 0,
+                color="#2E7D32", lw=1.0, linestyle="--", label="_nolegend_")
+    ax4.axvline(np.mean(np.abs(all_shorts)) if len(all_shorts) else 0,
+                color="#B71C1C", lw=1.0, linestyle="--", label="_nolegend_")
+
+    # 5. Top 15 assets by avg |weight|  (right)
+    ax5 = fig.add_subplot(gs[2, 1])
+    top_assets = asset_stats["avg_abs_weight"].dropna().head(15).sort_values()
+    bar_c = []
+    for sym in top_assets.index:
+        lf = asset_stats.loc[sym, "long_freq"]
+        sf = asset_stats.loc[sym, "short_freq"]
+        bar_c.append("#4CAF50" if lf >= sf else "#F44336")
+    ax5.barh(top_assets.index, top_assets.values, color=bar_c, alpha=0.80)
+    ax5.set_xlabel("Avg |Weight|")
+    ax5.set_title("Top 15 Assets by Avg |Weight|\n(green = more often long, red = more often short)")
+    ax5.tick_params(axis="y", labelsize=7)
+
+    # 6. Long/short weight concentration over time — stacked bars  (full width)
+    ax6 = fig.add_subplot(gs[3, :])
+    roll_long  = (active.clip(lower=0)  > 1e-6).sum(axis=1).rolling(21).mean()
+    roll_short = (active.clip(upper=0) < -1e-6).sum(axis=1).rolling(21).mean()
+    ax6.stackplot(daily.index,
+                  [roll_long.reindex(daily.index).fillna(0),
+                   roll_short.reindex(daily.index).fillna(0)],
+                  labels=["21d avg N Long", "21d avg N Short"],
+                  colors=["#A5D6A7", "#EF9A9A"], alpha=0.85)
+    ax6.set_ylabel("Asset count (21d rolling avg)")
+    ax6.set_title("Portfolio Breadth Over Time")
+    ax6.legend(fontsize=8, loc="upper left")
+    ax6.tick_params(axis="x", labelrotation=30, labelsize=8)
+
+    # 7. Strategy λ weights over time — stacked area (cross_signal_mv only)
+    if has_signal_hist:
+        ax7 = fig.add_subplot(gs[4, :])
+        lam_df = pd.DataFrame(signal_weights_history).T.sort_index()
+        lam_df = lam_df.reindex(daily.index).ffill().fillna(0.0)
+
+        palette = ["#2196F3", "#FF9800", "#4CAF50",
+                   "#F44336", "#9C27B0", "#00BCD4", "#795548"]
+        colors7 = palette[:len(lam_df.columns)]
+        ax7.stackplot(lam_df.index,
+                      [lam_df[c].values for c in lam_df.columns],
+                      labels=lam_df.columns.tolist(),
+                      colors=colors7, alpha=0.80)
+        ax7.set_ylim(0, 1)
+        ax7.set_ylabel("Strategy weight λ")
+        ax7.set_title("Cross-Signal MV: Strategy Allocation Over Time")
+        ax7.legend(fontsize=8, loc="upper left")
+        ax7.tick_params(axis="x", labelrotation=30, labelsize=8)
+
+    fig.suptitle(
+        f"Weight Distribution Analysis  |  method={method}",
+        fontsize=13, fontweight="bold", y=1.01,
+    )
+    fig.tight_layout()
+    plot_path = os.path.join(base_dir, f"weight_distribution_{method}.png")
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Weight distribution plot saved → {plot_path}")
+
+    # ── Console summary ───────────────────────────────────────────────────────
+    sep = "─" * 50
+    print(f"\n{sep}")
+    print(f"  Weight Distribution Summary  ({method})")
+    print(sep)
+    print(f"  Active days       : {len(daily)} / {len(final_weights)}")
+    print(f"  Avg gross leverage: {daily['gross_leverage'].mean():.4f}")
+    print(f"  Avg net exposure  : {daily['net_exposure'].mean():.4f}")
+    print(f"  Avg N long        : {daily['n_long'].mean():.1f}")
+    print(f"  Avg N short       : {daily['n_short'].mean():.1f}")
+    print(f"  Avg effective N   : {daily['effective_n'].mean():.1f}")
+    print(f"  Avg daily turnover: {daily['turnover'].mean():.4f}")
+    print(f"  Max single weight : {active.values.max():.4f}")
+    print(f"  Min single weight : {active.values.min():.4f}")
+    print(sep)

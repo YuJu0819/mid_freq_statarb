@@ -31,7 +31,7 @@ import matplotlib.patheffects as pe
 import numpy as np
 import pandas as pd
 
-from ..alpha.factor_health import FactorHealthEvaluator
+from ...alpha.factor_health import FactorHealthEvaluator
 
 
 _FOLD_RE = re.compile(r"ebm_(?:moe|homoe|model)_(\d{8})\.pkl$")

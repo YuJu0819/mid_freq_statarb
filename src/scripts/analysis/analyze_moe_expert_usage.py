@@ -30,8 +30,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-from ..core.utils import ensure_dir
-from .train_ebm_signal import RegimeSelector
+from ...core.utils import ensure_dir
+from ...alpha.moe import RegimeSelector
 
 
 # ── palette: up to 8 distinct regimes ────────────────────────────────────────

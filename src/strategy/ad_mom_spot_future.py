@@ -32,56 +32,21 @@ class FinalStrategy:
         self.factor_mask_config = factor_mask_config
         self.conviction_top_fraction = conviction_top_fraction
 
-    def neutralize_signal(self, signal_df: pd.DataFrame, beta_df: pd.DataFrame) -> pd.DataFrame:
+    def neutralize_signal(
+        self, signal_df: pd.DataFrame, beta_df: pd.DataFrame,
+    ) -> pd.DataFrame:
         """
         Removes Beta exposure from the signals using Cross-Sectional Regression.
         CRITICAL: Masks 0s and NaNs so we only neutralize the ACTIVE bets.
+
+        Phase-7 refactor: this body was a byte-identical copy of
+        LiquidationReversalStrategy.neutralize_signal — both now delegate
+        to src/alpha/neutralize.py. The method is preserved with the same
+        signature so every existing self.neutralize_signal(...) call site
+        keeps working.
         """
-        neutralized_data = []
-
-        # Iterate over indices that exist in both DataFrames
-        common_idx = signal_df.index.intersection(beta_df.index)
-
-        for ts in common_idx:
-            y = signal_df.loc[ts]
-            x = beta_df.loc[ts]
-
-            # --- MASKING LOGIC ---
-            valid_mask = (y != 0) & (y.notna()) & (
-                x.notna()) & (~np.isinf(y)) & (~np.isinf(x))
-
-            # Need at least 2 points to fit a line
-            if valid_mask.sum() < 2:
-                neutralized_data.append(y)
-                continue
-
-            Y_vals = y[valid_mask].values
-            X_vals = x[valid_mask].values
-
-            # --- FIX 2: Check for singular matrix (Low Variance) ---
-            if np.var(X_vals) < 1e-8:
-                # Variance is too low to fit a line; skip regression.
-                neutralized_data.append(y)
-                continue
-
-            try:
-                # Linear Regression: Y = m*X + c
-                slope, intercept = np.polyfit(X_vals, Y_vals, 1)
-
-                # Residual = Y - (m*X + c)
-                residuals = Y_vals - (slope * X_vals + intercept)
-
-                # Update only the active assets in the row
-                new_row = y.copy()
-                new_row[valid_mask] = residuals
-                neutralized_data.append(new_row)
-
-            except Exception:
-                # If SVD fails, keep original signals
-                neutralized_data.append(y)
-
-        # Reconstruct DataFrame and ensure alignment with original index
-        return pd.DataFrame(neutralized_data, index=common_idx, columns=signal_df.columns).reindex(signal_df.index).fillna(0.0)
+        from ..alpha.neutralize import _neutralize
+        return _neutralize(signal_df, beta_df)
 
     def on_rebalance(self, data: Dict[str, pd.DataFrame]) -> Tuple[Dict, Dict]:
         # --- 0. Handle Empty Data ---

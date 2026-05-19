@@ -1,11 +1,14 @@
-from ..backtest.engine import run_vectorized_backtest, trim_backtest_result
-from ..strategy.liquidation_reversal import LiquidationReversalStrategy
-from ..data.universe import load_validated_universe
-from ..data.rolling_universe import RollingUniverse, build_symbol_active_mask
-from ..data.binance_futures_rest import fetch_futures_klines, fetch_top_long_short_ratio
-from ..data.storage import parquet_path, save_bars, load_bars
-from ..core.utils import load_config, ensure_dir
-from ..backtest.reporting import *
+from ...backtest.engine import run_vectorized_backtest, trim_backtest_result
+from ...strategy.liquidation_reversal import LiquidationReversalStrategy
+from ...data.universe import load_validated_universe
+from ...data.rolling_universe import (
+    RollingUniverse, build_symbol_active_mask,
+    resolve_epochs, build_epoch_mask_from_data_dict,
+)
+from ...data.binance_futures_rest import fetch_futures_klines, fetch_top_long_short_ratio
+from ...data.storage import parquet_path, save_bars, load_bars
+from ...core.utils import load_config, ensure_dir
+from ...backtest.reporting import *
 import argparse
 import os
 import pandas as pd
@@ -217,25 +220,14 @@ def main():
     # --- Rolling Universe Epoch Mask -------------------------------------
     # Skipped when --no_rolling_universe is passed (epoch_mask_df stays None,
     # which the engine and strategy treat as "all symbols always active").
-    import pandas as _pd
-    epoch_mask_df = None
-    if not args.no_rolling_universe:
-        ru = RollingUniverse()
-        if not ru.is_empty():
-            ru_epochs = ru.get_epochs(args.start_date, args.end_date)
-            if ru_epochs:
-                print(
-                    f"\nBuilding rolling universe epoch mask ({len(ru_epochs)} epochs)...")
-                mask_cols = {}
-                for sym, df in all_data.items():
-                    ts_idx = _pd.DatetimeIndex(_pd.to_datetime(df["ts"]))
-                    active = build_symbol_active_mask(sym, df["ts"], ru_epochs)
-                    mask_cols[sym] = _pd.Series(active.values, index=ts_idx)
-                epoch_mask_df = _pd.DataFrame(mask_cols)
-                active_pairs = int(epoch_mask_df.sum().sum())
-                total_pairs = epoch_mask_df.size
-                print(
-                    f"  Active (date, symbol) pairs: {active_pairs:,} / {total_pairs:,}")
+    # Phase-2 refactor: this preamble + mask-builder is now in
+    # src/data/rolling_universe.py so backtest_reversal and backtest_multi
+    # share a single implementation.
+    ru_epochs = resolve_epochs(
+        args.start_date, args.end_date,
+        no_rolling_universe=args.no_rolling_universe)
+    epoch_mask_df = (build_epoch_mask_from_data_dict(all_data, ru_epochs)
+                     if ru_epochs else None)
     # ----------------------------------------------------------------------
 
     # --- Strategy Execution ---

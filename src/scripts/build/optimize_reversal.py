@@ -1,4 +1,4 @@
-from src.scripts.backtest_reversal import load_metrics_from_csv_folder
+from src.scripts.backtest.backtest_reversal import load_metrics_from_csv_folder
 from src.core.utils import load_config
 from src.data.storage import parquet_path, save_bars, load_bars
 from src.data.binance_futures_rest import fetch_futures_klines, fetch_top_long_short_ratio

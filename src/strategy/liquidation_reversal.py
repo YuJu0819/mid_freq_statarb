@@ -23,65 +23,37 @@ class LiquidationReversalStrategy:
         self.regime_filter_threshold = regime_filter_threshold
 
     def calculate_ts_zscore(self, df: pd.DataFrame, window: int) -> pd.DataFrame:
+        # Phase-7 refactor note: this is NOT a duplicate of
+        # core.cs._ts_zscore — that one has no .clip(-2, 2) on the std
+        # denominator. Clipping the std caps the effective normalisation
+        # for high-volatility series, which is specific to the reversal
+        # strategy's design. Leaving the implementation in-place.
         rolling_mean = df.rolling(window=window, min_periods=window//2).mean()
         rolling_std = df.rolling(window=window, min_periods=window//2).std()
         return (df - rolling_mean) / rolling_std.replace(0, np.nan).clip(-2, 2)
 
     def calculate_cs_zscore(self, df_wide: pd.DataFrame) -> pd.DataFrame:
-        means = df_wide.mean(axis=1)
-        stds = df_wide.std(axis=1)
-        return df_wide.sub(means, axis=0).div(stds.replace(0, np.nan), axis=0)
+        # Phase-7 refactor: byte-equivalent to core.cs._cs_zscore. Method
+        # signature preserved so existing self.calculate_cs_zscore(...) call
+        # sites stay unchanged; body delegates to the canonical helper.
+        from ..core.cs import _cs_zscore as _cs
+        return _cs(df_wide)
 
-    def neutralize_signal(self, signal_df: pd.DataFrame, beta_df: pd.DataFrame) -> pd.DataFrame:
+    def neutralize_signal(
+        self, signal_df: pd.DataFrame, beta_df: pd.DataFrame,
+    ) -> pd.DataFrame:
         """
         Removes Beta exposure from the signals using Cross-Sectional Regression.
         CRITICAL: Masks 0s and NaNs so we only neutralize the ACTIVE bets.
+
+        Phase-7 refactor: byte-equivalent body (on aligned-index inputs,
+        which is the only call pattern this strategy uses) lifted to
+        src/alpha/neutralize.py. Method preserved as a thin delegation so
+        every existing call site (self.neutralize_signal(...)) keeps the
+        same signature.
         """
-        neutralized_data = []
-
-        # Iterate over indices that exist in both DataFrames
-        common_idx = signal_df.index.intersection(beta_df.index)
-
-        for ts in common_idx:
-            y = signal_df.loc[ts]
-            x = beta_df.loc[ts]
-
-            # --- MASKING LOGIC ---
-            valid_mask = (y != 0) & (y.notna()) & (
-                x.notna()) & (~np.isinf(y)) & (~np.isinf(x))
-
-            # Need at least 2 points to fit a line
-            if valid_mask.sum() < 2:
-                neutralized_data.append(y)
-                continue
-
-            Y_vals = y[valid_mask].values
-            X_vals = x[valid_mask].values
-
-            # --- FIX 2: Check for singular matrix (Low Variance) ---
-            if np.var(X_vals) < 1e-8:
-                # Variance is too low to fit a line; skip regression.
-                neutralized_data.append(y)
-                continue
-
-            try:
-                # Linear Regression: Y = m*X + c
-                slope, intercept = np.polyfit(X_vals, Y_vals, 1)
-
-                # Residual = Y - (m*X + c)
-                residuals = Y_vals - (slope * X_vals + intercept)
-
-                # Update only the active assets in the row
-                new_row = y.copy()
-                new_row[valid_mask] = residuals
-                neutralized_data.append(new_row)
-
-            except Exception:
-                # If SVD fails, keep original signals
-                neutralized_data.append(y)
-
-        # Reconstruct DataFrame and ensure alignment with original index
-        return pd.DataFrame(neutralized_data, index=common_idx, columns=signal_df.columns).reindex(signal_df.index).fillna(0.0)
+        from ..alpha.neutralize import _neutralize
+        return _neutralize(signal_df, beta_df)
 
     def _compute_signals_for_symbols(
         self,

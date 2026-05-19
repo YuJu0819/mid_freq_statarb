@@ -4,18 +4,21 @@ import time
 import glob
 import pandas as pd
 from binance.exceptions import BinanceAPIException
-from ..core.utils import load_config
-from ..data.binance_rest import fetch_klines as fetch_spot_klines
-from ..data.binance_futures_rest import fetch_futures_klines
-from ..data.storage import parquet_path, save_bars, load_bars
-from ..backtest.engine import run_multi_asset, run_vectorized_backtest, trim_backtest_result
-from ..backtest.reporting import *
-from ..data.binance_futures_rest import fetch_funding_rate
-from ..strategy.ad_mom_spot_future import FinalStrategy
-from .. import factors
-from ..strategy.distributed import DistributedStrategy
-from ..data.universe import load_validated_universe
-from ..data.rolling_universe import RollingUniverse, build_symbol_active_mask
+from ...core.utils import load_config
+from ...data.binance_rest import fetch_klines as fetch_spot_klines
+from ...data.binance_futures_rest import fetch_futures_klines
+from ...data.storage import parquet_path, save_bars, load_bars
+from ...backtest.engine import run_multi_asset, run_vectorized_backtest, trim_backtest_result
+from ...backtest.reporting import *
+from ...data.binance_futures_rest import fetch_funding_rate
+from ...strategy.ad_mom_spot_future import FinalStrategy
+from ... import factors
+from ...strategy.distributed import DistributedStrategy
+from ...data.universe import load_validated_universe
+from ...data.rolling_universe import (
+    RollingUniverse, build_symbol_active_mask,
+    resolve_epochs, build_epoch_mask_from_data_dict,
+)
 
 
 def load_local_oi_data(symbol, start_date, end_date, data_dir="./data/open_interest"):
@@ -254,24 +257,13 @@ def main():
     # --- Rolling Universe Epoch Mask -------------------------------------
     # Skipped when --no_rolling_universe is passed (epoch_mask_df stays None,
     # which the engine and strategy treat as "all symbols always active").
-    epoch_mask_df = None
-    if not args.no_rolling_universe:
-        ru = RollingUniverse()
-        if not ru.is_empty():
-            ru_epochs = ru.get_epochs(args.start_date, args.end_date)
-            if ru_epochs:
-                print(
-                    f"\nBuilding rolling universe epoch mask ({len(ru_epochs)} epochs)...")
-                mask_cols = {}
-                for sym, df in all_data.items():
-                    ts_idx = pd.DatetimeIndex(pd.to_datetime(df["ts"]))
-                    active = build_symbol_active_mask(sym, df["ts"], ru_epochs)
-                    mask_cols[sym] = pd.Series(active.values, index=ts_idx)
-                epoch_mask_df = pd.DataFrame(mask_cols)
-                active_pairs = int(epoch_mask_df.sum().sum())
-                total_pairs = epoch_mask_df.size
-                print(
-                    f"  Active (date, symbol) pairs: {active_pairs:,} / {total_pairs:,}")
+    # Phase-2 refactor: shared with backtest_reversal via
+    # src/data/rolling_universe.py.
+    ru_epochs = resolve_epochs(
+        args.start_date, args.end_date,
+        no_rolling_universe=args.no_rolling_universe)
+    epoch_mask_df = (build_epoch_mask_from_data_dict(all_data, ru_epochs)
+                     if ru_epochs else None)
     # ----------------------------------------------------------------------
 
     strat = FinalStrategy(lookback=30, quantile=0.4, min_volume_usd=10_000_000,

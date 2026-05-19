@@ -126,14 +126,14 @@ if [[ "$REFRESH_UNIVERSE" -eq 1 ]]; then
     echo "  Universe Refresh  (top-$REFRESH_TOP_N by 24h volume)"
     echo "──────────────────────────────────────────────────"
     echo "  Checking current coverage first ..."
-    python -m src.scripts.refresh_universe \
+    python -m src.scripts.data.refresh_universe \
         --check_coverage \
         --top_n "$REFRESH_TOP_N" \
         --coverage_threshold "$COVERAGE_THRESHOLD"
 
     echo ""
     echo "  Fetching new top-$REFRESH_TOP_N snapshot and updating config.yaml ..."
-    python -m src.scripts.refresh_universe \
+    python -m src.scripts.data.refresh_universe \
         --top_n "$REFRESH_TOP_N" \
         --apply \
         --download_data
@@ -142,13 +142,13 @@ fi
 # --- Step 1: Download metrics (OI + ls_ratio archives) ----------------------
 if should_run 1; then
     step_header 1 "download_metrics  (OI + ls_ratio archives)"
-    python -m src.scripts.download_metrics
+    python -m src.scripts.data.download_metrics
 fi
 
 # --- Step 2: Accumulate recent l/s ratio ------------------------------------
 if should_run 2; then
     step_header 2 "download_ls_ratio  (last ${LS_DAYS} days)"
-    python -m src.scripts.download_ls_ratio \
+    python -m src.scripts.data.download_ls_ratio \
         --days "$LS_DAYS" \
         --interval "$LS_INTERVAL"
 fi
@@ -156,7 +156,7 @@ fi
 # --- Step 3: Validate universe + pre-cache prices ---------------------------
 if should_run 3; then
     step_header 3 "prepare_universe  ($START_DATE → $END_DATE)${ROLLING:+  [rolling]}"
-    python -m src.scripts.prepare_universe \
+    python -m src.scripts.data.prepare_universe \
         --start_date "$START_DATE" \
         --end_date   "$END_DATE" \
         --min_coverage "$MIN_COVERAGE" \
@@ -166,7 +166,7 @@ fi
 # --- Step 4: Momentum backtest ----------------------------------------------
 if should_run 4; then
     step_header 4 "backtest_momentum"
-    python -m src.scripts.backtest_multi \
+    python -m src.scripts.backtest.backtest_multi \
         --start_date "$START_DATE" \
         --end_date   "$END_DATE" \
         --run_id     "$RUN_ID"
@@ -175,7 +175,7 @@ fi
 # --- Step 5: Reversal backtest ----------------------------------------------
 if should_run 5; then
     step_header 5 "backtest_reversal"
-    python -m src.scripts.backtest_reversal \
+    python -m src.scripts.backtest.backtest_reversal \
         --start_date "$START_DATE" \
         --end_date   "$END_DATE" \
         --run_id     "$RUN_ID"
@@ -184,7 +184,7 @@ fi
 # --- Step 6: Combined portfolio ---------------------------------------------
 if should_run 6; then
     step_header 6 "backtest_combo  (momentum + reversal)"
-    python -m src.scripts.backtest_combo \
+    python -m src.scripts.backtest.backtest_combo \
         --run_id     "$RUN_ID" \
         --start_date "$START_DATE" \
         --end_date   "$END_DATE" \
@@ -196,14 +196,14 @@ fi
 # --- Step 7: Weight analysis -------------------------------------------------
 if should_run 7; then
     step_header 7 "analyze_weights"
-    python -m src.scripts.analyze_weights \
+    python -m src.scripts.analysis.analyze_weights \
         --run_id "$RUN_ID"
 fi
 
 # --- Step 8: Build ML factor panel -------------------------------------------
 if should_run 8; then
     step_header 8 "build_factor_panel"
-    python -m src.scripts.build_factor_panel \
+    python -m src.scripts.build.build_factor_panel \
         --run_id     "$RUN_ID" \
         --start_date "$START_DATE" \
         --end_date   "$END_DATE"
@@ -213,7 +213,7 @@ fi
 if should_run 9; then
     step_header 9 "train_ebm_signal"
     PANEL_PATH="./data/ml/factor_panel_${START_DATE}_${END_DATE}.parquet"
-    python -m src.scripts.train_ebm_signal \
+    python -m src.scripts.build.train_ebm_signal \
         --run_id        "$RUN_ID" \
         --panel_path    "$PANEL_PATH" \
         --target_col    ret_1d \
@@ -246,7 +246,7 @@ if should_run 10; then
 
     # 10a. EBM signal alone
     echo "  [10a] EBM standalone backtest..."
-    python -m src.scripts.backtest_combo \
+    python -m src.scripts.backtest.backtest_combo \
         --run_id     "$RUN_ID" \
         --start_date "$START_DATE" \
         --end_date   "$END_DATE" \
@@ -256,7 +256,7 @@ if should_run 10; then
 
     # 10b. Full 3-strategy combo (momentum + reversal + ebm)
     echo "  [10b] Full 3-strategy combo (momentum + reversal + ebm)..."
-    python -m src.scripts.backtest_combo \
+    python -m src.scripts.backtest.backtest_combo \
         --run_id     "$RUN_ID" \
         --start_date "$START_DATE" \
         --end_date   "$END_DATE" \
@@ -266,7 +266,7 @@ if should_run 10; then
 
     # 10c. Weight analysis including EBM
     echo "  [10c] Weight analysis (all 3 strategies)..."
-    python -m src.scripts.analyze_weights \
+    python -m src.scripts.analysis.analyze_weights \
         --run_id     "$RUN_ID" \
         --strategies momentum reversal ebm
 fi
@@ -275,7 +275,7 @@ fi
 if should_run 11; then
     step_header 11 "analyze_ebm_predictions"
     PANEL_PATH="./data/ml/factor_panel_${START_DATE}_${END_DATE}.parquet"
-    python -m src.scripts.analyze_ebm_predictions \
+    python -m src.scripts.analysis.analyze_ebm_predictions \
         --run_id        "$RUN_ID" \
         --panel_path    "$PANEL_PATH" \
         --target_col    ret_1d \

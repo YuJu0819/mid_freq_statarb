@@ -79,8 +79,6 @@ construction invariants that are applied at every stage of the pipeline:
 
 - Daily **mean-variance optimisation** in strategy-return space.
 - **EMA smoothing** as a post-process on the final signal.
-- **Ledoit-Wolf shrinkage** stabilises the covariance matrix, which is
-  otherwise unstable because the number of signals is small.
 
 ---
 

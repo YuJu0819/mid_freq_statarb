@@ -79,6 +79,8 @@ import os
 
 import numpy as np
 import pandas as pd
+import yaml
+from joblib import Parallel, delayed
 from tqdm import tqdm
 
 from ...core.utils import load_config
@@ -168,6 +170,11 @@ def main():
     # Note: label-flicker hysteresis is NOT a panel-build knob. The trainer
     # applies it at use time via `--moe_hysteresis` (RegimeSelector), which
     # keeps it sweepable without rebuilding the panel.
+    ap.add_argument("--n_epoch_jobs", type=int, default=-1,
+                    help="Parallel workers for per-epoch panel builds. "
+                         "-1 = use all cores; 1 = sequential (useful for "
+                         "debugging). Each worker computes factors for one "
+                         "epoch's universe independently.")
     args = ap.parse_args()
 
     cfg = load_config()
@@ -212,101 +219,142 @@ def main():
     print(f"  OI coverage  : {len(oi_store)}/{len(mom_data)} symbols")
     print(f"  L/S coverage : {len(ls_store)}/{len(mom_data)} symbols")
 
-    # ── Compute all factors ───────────────────────────────────────────────────
-    print("\nComputing factors...")
-    panel = compute_factors(mom_data, ls_store, oi_store=oi_store)
-    print(f"  Panel shape: {panel.shape}")
-
-    # ── Pre-launch NaN masking ────────────────────────────────────────────────
-    # Symbols whose price data was forward-filled before they actually started
-    # trading produce all-zero rolling features that survive dropna(y) and
-    # corrupt EBM training. Mask those rows so they become NaN → y becomes
-    # NaN at build_target time → row gets dropped.
-    if not args.no_prelaunch_mask:
-        print("\nMasking pre-launch (forward-filled) rows...")
-        panel = mask_pre_launch_rows(
-            panel, min_active_days=args.prelaunch_min_active_days)
-    else:
-        print("\nSkipping pre-launch mask (--no_prelaunch_mask).")
-
-    # ── Post-death NaN masking ────────────────────────────────────────────────
-    # Symmetric to pre-launch: after a symbol is delisted/rebranded the data
-    # feed keeps emitting the last close → indefinite ret_1d == 0 tail. Same
-    # contamination pattern, fixed the same way.
-    if not args.no_postdeath_mask:
-        print("\nMasking post-death (delisted/rebranded) rows...")
-        panel = mask_post_death_rows(
-            panel, min_active_days=args.prelaunch_min_active_days)
-    else:
-        print("\nSkipping post-death mask (--no_postdeath_mask).")
-
-    # ── Rolling Universe Mask ─────────────────────────────────────────────────
-    # For each (ts, symbol) row that falls outside the symbol's active epoch,
-    # set all factor columns to NaN. The shape of the panel is unchanged —
-    # inactive entries remain as rows but with NaN values, so the EBM can
-    # distinguish "no signal" from a genuine zero-valued factor.
-    #
-    # IMPORTANT: Skip this when building a panel for per-epoch EBM training
-    # (--no_rolling_universe). The per-epoch pipeline filters to active symbols
-    # itself and needs pre-epoch history for TS rolling warmup. Masking it here
-    # causes the training window to see mostly NaN → avg symbols degrades across
-    # later epochs because their pre-epoch lookback data is zeroed out.
-    # Phase-2 refactor: shared preamble helper. The long-format mask loop
-    # below is structurally distinct from the wide-DF pattern in the
-    # backtest scripts, so it stays local.
-    ru_epochs = resolve_epochs(
-        args.start_date, args.end_date,
-        no_rolling_universe=args.no_rolling_universe)
-    if ru_epochs:
-        print("\nApplying rolling universe mask to factor panel...")
-        factor_cols = [
-            c for c in panel.columns if c not in ("ts", "symbol")]
-        panel_ts = pd.to_datetime(panel["ts"])
-        active_flag = pd.Series(False, index=panel.index)
-        for ep in ru_epochs:
-            ep_start = pd.Timestamp(ep["epoch_start"])
-            ep_end = pd.Timestamp(
-                ep["epoch_end"]) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-            ep_syms = set(ep["symbols"])
-            in_ep = (panel_ts >= ep_start) & (
-                panel_ts <= ep_end) & panel["symbol"].isin(ep_syms)
-            active_flag |= in_ep
-        n_masked = (~active_flag).sum()
-        panel.loc[~active_flag, factor_cols] = np.nan
-        print(
-            f"  {n_masked:,} rows masked as NaN ({n_masked / len(panel):.1%} of panel).")
-    else:
-        print("\nSkipping rolling universe NaN mask (--no_rolling_universe). "
-              "Full history retained for all symbols.")
-
-    # ── Attach strategy signals ───────────────────────────────────────────────
-    if not args.no_signals:
-        print("\nAttaching strategy signals...")
-        panel = attach_signals(panel, args.run_id)
-
-    # ── Save ──────────────────────────────────────────────────────────────────
-    # Filename includes the vol-threshold mode so an A/B run (expanding vs
-    # rolling) produces two distinct parquets that downstream consumers
-    # (train_ebm_signal, backtest) can point at independently. The legacy
-    # filename (no suffix) is preserved for the default 'expanding' mode so
-    # existing scripts keep working.
+    # ── Output suffix (vol_threshold_mode tagging) ───────────────────────────
     if args.vol_threshold_mode == "expanding":
         suffix = ""
     elif args.vol_threshold_mode == "rolling":
         suffix = f"_volroll{args.vol_threshold_window}"
     else:
         suffix = f"_vol{args.vol_threshold_mode}"
-    out_name = (f"factor_panel_{args.start_date}_{args.end_date}"
-                f"{suffix}.parquet")
-    out_path = os.path.join(args.out_dir, out_name)
-    panel.to_parquet(out_path, index=False)
 
-    print(f"\nFactor panel saved → {out_path}")
-    print(f"  Rows   : {len(panel):,}")
-    print(f"  Columns: {len(panel.columns)}")
-    print(f"  Date range : {panel['ts'].min()} → {panel['ts'].max()}")
-    print(f"  Symbols    : {panel['symbol'].nunique()}")
-    print(f"\n  Columns:\n  " + "\n  ".join(panel.columns.tolist()))
+    cf_epochs = resolve_epochs(
+        args.start_date, args.end_date,
+        no_rolling_universe=args.no_rolling_universe)
+
+    def _build_one_panel(
+        mom_subset: dict, ls_subset: dict, oi_subset: dict | None, label: str
+    ) -> pd.DataFrame:
+        """Run compute_factors + masks + attach_signals for one universe."""
+        print(f"\nComputing factors [{label}, {len(mom_subset)} symbols]...")
+        p = compute_factors(mom_subset, ls_subset, oi_store=oi_subset)
+        print(f"  Panel shape: {p.shape}")
+
+        if not args.no_prelaunch_mask:
+            print("  Masking pre-launch rows...")
+            p = mask_pre_launch_rows(
+                p, min_active_days=args.prelaunch_min_active_days)
+        if not args.no_postdeath_mask:
+            print("  Masking post-death rows...")
+            p = mask_post_death_rows(
+                p, min_active_days=args.prelaunch_min_active_days)
+
+        if not args.no_signals:
+            print("  Attaching strategy signals...")
+            p = attach_signals(p, args.run_id)
+        return p
+
+    # ── Single-pass mode (--no_rolling_universe) ─────────────────────────────
+    # Falls back to the legacy single-file layout for callers that don't want
+    # per-epoch panels (e.g. baseline-test runs).
+    if not cf_epochs:
+        panel = _build_one_panel(mom_data, ls_store, oi_store, "single universe")
+        out_name = (f"factor_panel_{args.start_date}_{args.end_date}"
+                    f"{suffix}.parquet")
+        out_path = os.path.join(args.out_dir, out_name)
+        panel.to_parquet(out_path, index=False)
+        print(f"\nFactor panel saved → {out_path}")
+        print(f"  Rows   : {len(panel):,}")
+        print(f"  Columns: {len(panel.columns)}")
+        print(f"  Date range : {panel['ts'].min()} → {panel['ts'].max()}")
+        print(f"  Symbols    : {panel['symbol'].nunique()}")
+        return
+
+    # ── Per-epoch mode (rolling universe enabled) ────────────────────────────
+    # For each rolling-universe epoch, build a panel containing the FULL
+    # historical date range but restricted to that epoch's universe of
+    # symbols. Each symbol keeps its full per-symbol history so TS rolling
+    # features warm up correctly; CS columns are computed across only that
+    # epoch's universe, so cross-sectional stats are clean. Saved as one
+    # parquet per epoch inside a directory keyed by (start, end).
+    #
+    # Training-time consumers (train_ebm_signal, analyze_*) route each
+    # walk-forward fold to the panel whose universe matches the fold's
+    # prediction-date epoch, so the model trains on the same CS distribution
+    # it will face at prediction time.
+    out_dir_name = (f"factor_panel_{args.start_date}_{args.end_date}"
+                    f"{suffix}")
+    out_dir = os.path.join(args.out_dir, out_dir_name)
+    os.makedirs(out_dir, exist_ok=True)
+
+    n_jobs = args.n_epoch_jobs if args.n_epoch_jobs != 0 else 1
+    if n_jobs == -1:
+        n_jobs_resolved = max(1, os.cpu_count() or 1)
+    else:
+        n_jobs_resolved = max(1, min(n_jobs, len(cf_epochs)))
+    print(f"\nPer-epoch panels → {out_dir}/")
+    print(f"  Building {len(cf_epochs)} per-epoch panel files in parallel "
+          f"({n_jobs_resolved} workers).\n"
+          f"  Each file contains full {args.start_date}→{args.end_date} "
+          f"history restricted to that epoch's universe.\n")
+
+    def _build_and_save(ep, i, n_total):
+        ep_syms = list(ep["symbols"])
+        snap = ep["snapshot_date"]
+        label = (f"epoch {i}/{n_total}  snap={snap}  "
+                 f"{ep['epoch_start']} → {ep['epoch_end']}")
+        mom_ep = {s: mom_data[s] for s in ep_syms if s in mom_data}
+        ls_ep  = {s: ls_store[s] for s in ep_syms if s in ls_store}
+        oi_ep  = ({s: oi_store[s] for s in ep_syms if s in oi_store}
+                  if oi_store else None)
+        if not mom_ep:
+            print(f"  [skip] {label}: no data for any symbol in universe.")
+            return None
+        panel_ep = _build_one_panel(mom_ep, ls_ep, oi_ep, label)
+        ep_path = os.path.join(out_dir, f"epoch_{snap}.parquet")
+        panel_ep.to_parquet(ep_path, index=False)
+        print(f"  Saved → {ep_path}  "
+              f"(rows={len(panel_ep):,}, syms={panel_ep['symbol'].nunique()})")
+        return ep_path
+
+    if n_jobs_resolved == 1:
+        results = [
+            _build_and_save(ep, i, len(cf_epochs))
+            for i, ep in enumerate(cf_epochs, 1)
+        ]
+    else:
+        # Use loky (subprocess) — each worker computes factors independently
+        # so no shared-state contention. Bundles mom_data / oi_store /
+        # ls_store get pickled per worker; the per-epoch slicing inside
+        # _build_and_save reduces what each worker actually iterates over.
+        results = Parallel(n_jobs=n_jobs_resolved, backend="loky")(
+            delayed(_build_and_save)(ep, i, len(cf_epochs))
+            for i, ep in enumerate(cf_epochs, 1)
+        )
+    written_paths = [p for p in results if p]
+
+    # Manifest: index file so consumers can discover the per-epoch layout.
+    manifest_path = os.path.join(out_dir, "manifest.yaml")
+    manifest = {
+        "start_date":   args.start_date,
+        "end_date":     args.end_date,
+        "vol_threshold_mode": args.vol_threshold_mode,
+        "epochs": [
+            {
+                "snapshot_date": ep["snapshot_date"],
+                "epoch_start":   ep["epoch_start"],
+                "epoch_end":     ep["epoch_end"],
+                "n_symbols":     len(ep["symbols"]),
+                "file":          f"epoch_{ep['snapshot_date']}.parquet",
+            }
+            for ep in cf_epochs
+        ],
+    }
+    with open(manifest_path, "w") as f:
+        yaml.safe_dump(manifest, f, sort_keys=False)
+
+    print(f"\nManifest → {manifest_path}")
+    print(f"Wrote {len(written_paths)} per-epoch panel files.")
+    print(f"Directory: {out_dir}/")
 
 
 if __name__ == "__main__":

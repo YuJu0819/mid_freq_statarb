@@ -5,7 +5,7 @@ import os
 import numpy as np
 
 
-def plot_equity_curve(equity_curve: pd.DataFrame, save_path: str):
+def plot_equity_curve(equity_curve: pd.DataFrame, save_path: str, split_date=None):
     plt.figure(figsize=(12, 6))
 
     plt.plot(equity_curve.index, equity_curve["equity"],
@@ -18,6 +18,13 @@ def plot_equity_curve(equity_curve: pd.DataFrame, save_path: str):
     if "equity_lag10" in equity_curve.columns:
         plt.plot(equity_curve.index, equity_curve["equity_lag10"],
                  label="Lag 10", linewidth=1.2, color="firebrick", linestyle=":", alpha=0.85)
+
+    if split_date is not None and not equity_curve.empty:
+        sd = pd.Timestamp(split_date)
+        if equity_curve.index.min() <= sd <= equity_curve.index.max():
+            plt.axvline(sd, color="black", linestyle="--", linewidth=1, alpha=0.7)
+            ymax = equity_curve["equity"].max()
+            plt.text(sd, ymax, "  IS │ OOS", va="top", ha="left", fontsize=9)
 
     plt.title("Backtest Equity Curve — Signal Lag Comparison")
     plt.xlabel("Date")

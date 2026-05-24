@@ -20,7 +20,7 @@
 | **Frequency**       | Mid-frequency, daily rebalance                                                                                         |
 | **Style**           | Cross-sectional statistical arbitrage, market-neutral                                                                  |
 | **Universe**        | 150 symbols, rolling quarterly refresh                                                                                 |
-| **Backtest window** | 20240101 — 20260101                                                                                                    |
+| **Backtest window** | 20210101 — 20260101                                                                                                    |
 | **Cost model**      | 5 bps fee + 2 bps slippage                                                                                             |
 | **Data sources**    | Binance Futures REST (price, volume), funding-rate history, open-interest archive, top-trader long/short ratio archive |
 
@@ -86,27 +86,59 @@ construction invariants that are applied at every stage of the pipeline:
 
 ## 3. Performance
 
+All strategies use the same train / test split:
+
+- **In-sample (IS):** 2021-01-01 → 2024-12-31 — used for parameter
+  selection, walk-forward training (for EBM), and stability inspection.
+- **Out-of-sample (OOS):** 2025-01-01 → 2025-12-31 — held out and
+  evaluated only after the IS configuration is frozen.
+
+Strategy parameters were selected by **sparse grid search** over the IS
+window, retaining only configurations that sit inside a **manually-verified
+stable region** of the parameter landscape (i.e. surrounded by neighbouring
+grid points with consistent IS performance). This deliberately avoids
+fitting to isolated peaks, biasing the selection toward parameter choices
+whose IS edge is robust to small perturbations.
+
 ### 3.1 Liquidation Reversal
+
+- **IS:** 2021-01-01 → 2024-12-31 — used to choose `ts_lookback`,
+  `sentiment_ma_window`, `half_life_decay`, and the risk-control knobs
+  (`max_weight`, `min_active_symbols`).
+- **OOS:** 2025-01-01 → 2025-12-31.
 
 ![Liquidation reversal equity curve](docs/img/equity_curve_reversal.png)
 
-|                   |        |
-| ----------------- | ------ |
-| Final return      | 39.1 % |
-| Annualised Sharpe | 1.35   |
-| PSR (SR\* = 0)    | 0.9923 |
+|                   |         |
+| ----------------- | ------- |
+| Final return      | 30.95 % |
+| Annualised Sharpe | 0.65    |
+| PSR (SR\* = 0)    | 0.9923  |
 
 ### 3.2 Momentum
 
+- **IS:** 2021-01-01 → 2024-12-31 — used to tune `lookback`,
+  `smooth_lookback`, `funding_z_threshold`, and the vol-rank adjustment.
+- **OOS:** 2025-01-01 → 2025-12-31.
+
 ![Momentum equity curve](docs/img/momentum_equity.png)
 
-|                   |        |
-| ----------------- | ------ |
-| Final return      | 24.5 % |
-| Annualised Sharpe | 1.02   |
-| PSR (SR\* = 0)    | 98.2   |
+|                   |         |
+| ----------------- | ------- |
+| Final return      | 65.69 % |
+| Annualised Sharpe | 1.25    |
+| PSR (SR\* = 0)    | 0.982   |
 
 ### 3.3 EBM ML Signal
+
+- **IS (walk-forward training):** 2021-01-01 → 2024-12-31 — every fold
+  re-trains on a trailing 252-day window inside the IS range and predicts
+  the next `retrain_freq` days. Used to fix `train_window`,
+  `retrain_freq`, `interactions`, `min_samples_leaf`, and the MoE
+  routing settings.
+- **OOS:** 2025-01-01 → 2025-12-31 — the model continues its
+  walk-forward retrain cycle over this held-out year; reported metrics
+  are computed only on these predictions.
 
 ![EBM walk-forward summary](docs/img/EBM_for_README.png)
 
@@ -115,16 +147,20 @@ construction invariants that are applied at every stage of the pipeline:
   over time.
 - **Bottom-right:** cumulative PnL of the EBM signal in isolation.
 
-|                   |       |
-| ----------------- | ----- |
-| Final return      | 62.6% |
-| Annualised Sharpe | 1.56  |
-| PSR (SR\* = 0)    | 99.98 |
+|                   |        |
+| ----------------- | ------ |
+| Final return      | 111.4% |
+| Annualised Sharpe | 1.22   |
+| PSR (SR\* = 0)    | 99.98  |
 
 ### 3.4 Combined Portfolio
 
 - Blends the three signals through the strategy-space mean-variance
   optimiser.
+- **IS:** 2021-01-01 → 2024-12-31 — used to fit the strategy-space
+  covariance shrinkage and EMA smoothing of the combined weight vector.
+- **OOS:** 2025-01-01 → 2025-12-31 — reported metrics are computed on
+  the held-out year only.
 
 ![Combined portfolio equity curve](docs/img/equity_cross_signal_mv.png)
 
@@ -138,8 +174,8 @@ construction invariants that are applied at every stage of the pipeline:
   lock-step — the persistent market-neutral and dollar-balanced
   behaviour described above.
 
-|                   |        |
-| ----------------- | ------ |
-| Total return      | 51.2 % |
-| Annualised Sharpe | 1.91   |
-| PSR (SR\* = 0)    | .9974  |
+|                   |          |
+| ----------------- | -------- |
+| Total return      | 97.7 %   |
+| Annualised Sharpe | 1.**53** |
+| PSR (SR\* = 0)    | .9974    |

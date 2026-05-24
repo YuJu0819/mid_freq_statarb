@@ -69,6 +69,11 @@ def main():
                          "the EBM-warmup window when one strategy starts "
                          "later than the others (e.g. EBM begins 2024-01-01 "
                          "while momentum/reversal go back to 2023).")
+    ap.add_argument("--oos_start_date", default=None,
+                    help="Optional. Date (YYYY-MM-DD) at which to draw the "
+                         "IS|OOS divider line on the equity-curve plot. "
+                         "Purely a visual annotation; does not affect metrics "
+                         "or trimming. If omitted, no divider is drawn.")
     ap.add_argument("--strategies", nargs="*", default=None,
                     help="Strategy names to combine (default: all *.parquet in run_dir). "
                          "Example: --strategies momentum reversal ebm")
@@ -181,7 +186,13 @@ def main():
         for name, df in strategies.items():
             zeroed = 0
             for sym in df.columns:
-                ts_series = pd.Series(df.index, index=df.index)
+                # Wrap df.index in a Series with an explicit dtype. Passing
+                # the Index directly triggers pandas' deprecated dtype
+                # inference path (FutureWarning in pandas ≥ 2.1). Forcing
+                # the index's own dtype keeps the original timestamp type
+                # and silences the warning.
+                ts_series = pd.Series(
+                    df.index.values, index=df.index, dtype=df.index.dtype)
                 active = build_symbol_active_mask(sym, ts_series, ru_epochs)
                 inactive = ~active.values
                 if inactive.any():
@@ -474,7 +485,11 @@ def main():
         "equity_gross": equity_curve_gross,
     })
     plot_path = os.path.join(base_dir, f"equity_{args.method}.png")
-    plot_equity_curve(eq_df[["equity"]], plot_path)
+    plot_equity_curve(
+        eq_df[["equity"]],
+        plot_path,
+        split_date=args.oos_start_date,
+    )
 
     total_ret = (equity_curve.iloc[-1] / initial_cash) - 1
     total_ret_gross = (equity_curve_gross.iloc[-1] / initial_cash) - 1

@@ -159,7 +159,7 @@ DEFAULT_FEATURES = [
     "liquidity_rank_cs_delta",
 ]
 _FILTERED_COLS = {
-    'ls_chg_smooth3', 'oi_pct_chg_smooth3', 'basis_norm_smooth3', 'market_volatility', 'cs_z_oi_chg'
+    'ls_chg_smooth3', 'oi_pct_chg_smooth3', 'basis_norm_smooth3', 'market_volatility', 'combined_score', 'funding_penalty', 'oi_roc', 'oi_roc_delta'
 }
 
 # ---------------------------------------------------------------------------
@@ -238,9 +238,15 @@ def walk_forward(
     regime_selector: "RegimeSelector | None" = None,
     expert_panel: "pd.DataFrame | None" = None,
     pred_start_date: "pd.Timestamp | None" = None,
+    pred_end_date: "pd.Timestamp | None" = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, dict | None]:
     """
     Walk-forward EBM training.
+
+    When `pred_end_date` is provided, the OOS prediction loop stops after
+    the last date <= pred_end_date. Used by the per-epoch training driver
+    so each epoch's run only emits predictions inside that epoch's date
+    range — and then the next epoch starts fresh with its own panel.
 
     Non-MoE mode
     ------------
@@ -280,6 +286,17 @@ def walk_forward(
         if candidates:
             pred_start_idx = max(min_train_periods, candidates[0])
 
+    # Per-epoch driver clamp: stop emitting OOS predictions after
+    # pred_end_date so each epoch's walk_forward call only owns its own
+    # date range. The next epoch's call starts fresh (its first fold is
+    # a forced retrain on the new epoch's panel).
+    pred_end_idx = label_cutoff_idx
+    if pred_end_date is not None:
+        pe = pd.Timestamp(pred_end_date)
+        ub = [i for i, d in enumerate(dates) if pd.Timestamp(d) <= pe]
+        if ub:
+            pred_end_idx = min(label_cutoff_idx, ub[-1] + 1)
+
     all_preds: dict = {}
     all_importances: list = []
     all_fold_stats: list = []
@@ -289,13 +306,15 @@ def walk_forward(
     # Retrain schedule anchored to pred_start_idx so the first OOS prediction
     # date triggers an immediate retrain.
     retrain_set = {
-        i for i in range(pred_start_idx, label_cutoff_idx)
+        i for i in range(pred_start_idx, pred_end_idx)
         if (i - pred_start_idx) % retrain_freq == 0
     }
 
     print(f"  Dates total: {n_dates}  |  "
-          f"Prediction dates: {label_cutoff_idx - pred_start_idx}  |  "
+          f"Prediction dates: {pred_end_idx - pred_start_idx}  |  "
           f"First pred = {dates[pred_start_idx] if pred_start_idx < n_dates else 'N/A'}  |  "
+          f"Last pred ≤ "
+          f"{dates[pred_end_idx-1] if pred_end_idx > 0 else 'N/A'}  |  "
           f"Retraining {len(retrain_set)} times (every {retrain_freq} periods)")
     if use_block_bagging:
         print(f"  Block bagging ON: {n_outer_bags} bags  "
@@ -390,7 +409,7 @@ def walk_forward(
     # src/alpha/ebm_utils.py (imported at module top). The previous nested
     # definition was byte-identical and has been removed.
 
-    for pred_idx in range(pred_start_idx, label_cutoff_idx):
+    for pred_idx in range(pred_start_idx, pred_end_idx):
         pred_date = dates[pred_idx]
 
         # ── Retrain if needed ────────────────────────────────────────────────
@@ -556,7 +575,12 @@ def walk_forward(
                         pickle.dump(models, f)
 
             # ── In-sample metrics (shared for both modes) ─────────────────────
-            is_ic, _ = stats.spearmanr(y_pred_is, y_train)
+            # Guard against constant predictions (early folds with too-few
+            # samples can produce a flat y_pred_is, making Spearman undefined).
+            if np.std(y_pred_is) == 0 or np.std(y_train) == 0:
+                is_ic = float("nan")
+            else:
+                is_ic, _ = stats.spearmanr(y_pred_is, y_train)
             ss_res = np.sum((y_train - y_pred_is) ** 2)
             ss_tot = np.sum((y_train - np.mean(y_train)) ** 2)
             is_r2 = 1.0 - ss_res / (ss_tot + 1e-12)
@@ -609,6 +633,23 @@ def walk_forward(
             scores, index=pred_data["symbol"].values)
 
     if not all_preds:
+        # Two legitimate ways this happens:
+        #   - pred range is empty (e.g. per-epoch driver fed an epoch whose
+        #     entire date span is before --pred_start_date); the driver
+        #     should skip those upstream but we guard here too.
+        #   - retrain_set is empty (date range too short for min_train_periods).
+        # In the per-epoch driver we don't want one empty epoch to abort the
+        # whole run, so return empty frames and let the caller continue.
+        if pred_end_idx <= pred_start_idx:
+            print("  [walk_forward] Empty prediction range — returning "
+                  "empty outputs without training.")
+            return (
+                pd.DataFrame(),
+                pd.DataFrame(),
+                pd.DataFrame(),
+                pd.Series(dtype=float),
+                ({} if use_moe else None),
+            )
         raise RuntimeError(
             "No predictions generated. Increase the date range or reduce min_train_periods.")
 
@@ -1136,14 +1177,29 @@ def plot_report(
     ax1 = fig.add_subplot(gs[0, :])
     title_prefix = "Global EBM" if has_expert else "EBM"
     if not importance_df.empty:
-        mean_imp = importance_df.mean().sort_values(ascending=True)
+        # Build the importance ranking with two stability filters:
+        #   (a) drop terms with mean ≈ 0 — EBM sometimes selects an
+        #       interaction but regularizes it to zero contribution; these
+        #       render as 0-width bars (visible y-tick, no bar = "white
+        #       interval" in the ranking).
+        #   (b) drop terms appearing in < `min_folds_frac` of folds —
+        #       singleton/sparse interactions are noise, not signal.
+        n_folds = len(importance_df)
+        min_folds = max(2, int(0.05 * n_folds))  # at least 5% of folds
+        appearance = importance_df.notna().sum(axis=0)
+        mean_imp = importance_df.mean()
+        keep = (appearance >= min_folds) & (mean_imp.abs() > 1e-9)
+        mean_imp = mean_imp.loc[keep].sort_values(ascending=True)
+        dropped = int((~keep).sum())
         bar_colors = ["#F44336" if v <
                       0 else "#2196F3" for v in mean_imp.values]
         ax1.barh(mean_imp.index, mean_imp.values, color=bar_colors, alpha=0.85)
         ax1.axvline(0, color="black", lw=0.5)
         ax1.set_xlabel("Mean Importance (across folds)")
         ax1.set_title(
-            f"{title_prefix} Feature Importances (avg across walk-forward folds)")
+            f"{title_prefix} Feature Importances (avg across walk-forward folds) "
+            f"— showing {len(mean_imp)}/{len(appearance)} terms "
+            f"(dropped {dropped}: appears <{min_folds} folds or |mean|≈0)")
     else:
         ax1.text(0.5, 0.5, "No importance data", ha="center", va="center")
 
@@ -1289,7 +1345,8 @@ def plot_report(
 # ---------------------------------------------------------------------------
 
 def _run_epoch_pipeline(panel_epoch, feature_cols, args, ebm_kwargs,
-                        expert_ebm_kwargs, model_dir):
+                        expert_ebm_kwargs, model_dir,
+                        epoch_pred_start=None, epoch_pred_end=None):
     """
     Run the full EBM pipeline (build_target → normalize → walk_forward →
     neutralize → predictions_to_weights) on a single epoch's panel slice.
@@ -1297,6 +1354,14 @@ def _run_epoch_pipeline(panel_epoch, feature_cols, args, ebm_kwargs,
     `panel_epoch` must already be filtered to the epoch's active symbols but
     should contain FULL temporal history so that TS-based feature normalization
     and rolling lookback windows warm up correctly.
+
+    `epoch_pred_start` / `epoch_pred_end` clamp the OOS prediction emission
+    window to the epoch's active date range — outside that range the panel's
+    CS columns are valid (computed against this epoch's universe) but
+    semantically belong to a different epoch's model, so we don't emit
+    predictions there. Saves wall-clock time vs producing predictions for the
+    full date range and slicing afterwards. Pass `None` to emit predictions
+    across the full window (legacy / single-universe behaviour).
 
     Returns (weights, predictions_wide, importance_df, fold_stats_df,
              expert_importance_dfs, cmi_log_df). `cmi_log_df` is None unless
@@ -1394,6 +1459,19 @@ def _run_epoch_pipeline(panel_epoch, feature_cols, args, ebm_kwargs,
     main_panel = ep_adx if ep_adx is not None else ep
     raw_panel_for_experts = ep if ep_adx is not None else None
 
+    # Use the epoch's own pred_start when provided (max with global
+    # --pred_start_date so warmup is respected) and clamp the upper bound
+    # to the epoch's last date.
+    user_ps = getattr(args, "pred_start_date", None)
+    if epoch_pred_start is not None:
+        eff_pred_start = max(
+            pd.Timestamp(epoch_pred_start),
+            pd.Timestamp(user_ps) if user_ps else pd.Timestamp(
+                epoch_pred_start),
+        )
+    else:
+        eff_pred_start = user_ps
+
     (predictions_wide, importance_df,
      fold_stats_df, _is_rets,
      expert_importance_dfs) = walk_forward(
@@ -1424,7 +1502,8 @@ def _run_epoch_pipeline(panel_epoch, feature_cols, args, ebm_kwargs,
         expert_ebm_kwargs=expert_ebm_kwargs,
         regime_selector=raw_regime_selector,
         expert_panel=raw_panel_for_experts,
-        pred_start_date=getattr(args, "pred_start_date", None),
+        pred_start_date=eff_pred_start,
+        pred_end_date=epoch_pred_end,
     )
 
     if args.beta_neutral:
@@ -1454,7 +1533,11 @@ def main():
 
     # --- Data ----------------------------------------------------------------
     ap.add_argument("--panel_path",  required=True,
-                    help="Path to factor_panel_*.parquet from build_factor_panel.py")
+                    help="Path to a factor panel from build_factor_panel.py. "
+                         "Either a single .parquet (legacy / "
+                         "--no_rolling_universe build) or a directory containing "
+                         "per-epoch parquet files + manifest.yaml (default "
+                         "rolling-universe build).")
     ap.add_argument("--run_id",      required=True,
                     help="Run ID — weights saved to ./reports/strategies/{run_id}/ebm.parquet")
     ap.add_argument("--features",    nargs="*", default=None,
@@ -1656,12 +1739,47 @@ def main():
         out_dir, "ebm_models")) if args.save_models else None
 
     # ── Load panel ────────────────────────────────────────────────────────────
+    # Supports two layouts (handled by factor_panel_io.load_panel):
+    #   - Single .parquet file  → legacy single-universe panel.
+    #   - Directory with manifest.yaml → per-epoch panels (current default).
+    # In the per-epoch case, each fold reads from the panel whose universe
+    # matches the fold's prediction-date epoch (see _run_one_epoch below),
+    # so the EBM is trained on the same CS distribution it will face at
+    # prediction time. The "meta panel" below is the union of universe-
+    # independent columns (ts, symbol, raw ret/regime cols) across the
+    # per-epoch files — used only for things that don't depend on the CS
+    # columns: date range, feature_col selection, OOS metric computation.
     print(f"Loading panel: {args.panel_path}")
-    panel = pd.read_parquet(args.panel_path)
-    panel["ts"] = pd.to_datetime(panel["ts"])
-    panel = panel.sort_values(["ts", "symbol"]).reset_index(drop=True)
-    print(f"  {len(panel):,} rows  |  {panel['symbol'].nunique()} symbols  |  "
-          f"{panel['ts'].nunique()} dates")
+    from ...factor_panel_io import load_panel  # local import to avoid top reshuffle
+    bundle = load_panel(args.panel_path, eager=True)
+    if bundle.single:
+        panel = bundle.panel
+        panel["ts"] = pd.to_datetime(panel["ts"])
+        panel = panel.sort_values(["ts", "symbol"]).reset_index(drop=True)
+        print(f"  [single-universe panel] {len(panel):,} rows  |  "
+              f"{panel['symbol'].nunique()} symbols  |  "
+              f"{panel['ts'].nunique()} dates")
+    else:
+        print(f"  [per-epoch panel, {len(bundle.epochs)} epochs] "
+              f"loaded into RAM. Building meta-panel for OOS metrics...")
+        # Union per-epoch panels on (ts, symbol). For shared rows, raw TS
+        # columns (`ret_1d`, regime cols, ...) are identical across epochs;
+        # CS columns are not — so we drop them from the meta-panel and let
+        # the per-epoch panel inside _run_one_epoch carry the correct CS.
+        cs_independent_cols = None
+        meta_frames = []
+        for snap, p_ep in bundle.iter_panels():
+            p_ep = p_ep.copy()
+            p_ep["ts"] = pd.to_datetime(p_ep["ts"])
+            meta_frames.append(p_ep)
+        meta = pd.concat(meta_frames, ignore_index=True)
+        meta = (meta.sort_values(["ts", "symbol"])
+                    .drop_duplicates(["ts", "symbol"], keep="last")
+                    .reset_index(drop=True))
+        panel = meta
+        print(f"  Meta panel: {len(panel):,} rows  |  "
+              f"{panel['symbol'].nunique()} symbols  |  "
+              f"{panel['ts'].nunique()} dates")
 
     # ── Optional: anchor first prediction date ────────────────────────────────
     # Panel is NOT truncated. Pre-pred_start_date rows stay in the panel as
@@ -1761,7 +1879,39 @@ def main():
             ep_end = pd.Timestamp(ep_dict["epoch_end"])
             ep_syms = ep_dict["symbols"]
 
-            panel_ep = panel[panel["symbol"].isin(ep_syms)].copy()
+            # Skip epochs whose date range is entirely before the user's
+            # --pred_start_date — no OOS predictions would be emitted for
+            # them, and walk_forward would raise on the empty range.
+            user_ps = getattr(args, "pred_start_date", None)
+            if user_ps is not None and ep_end < pd.Timestamp(user_ps):
+                print(f"    [skip] Epoch {ep_dict['epoch_start']} → "
+                      f"{ep_dict['epoch_end']}: ends before "
+                      f"--pred_start_date={user_ps}.")
+                return None
+
+            # Per-epoch panel:
+            # - bundle.single == True (legacy single .parquet): fall back to
+            #   slicing the meta panel by symbol — same as before, but CS
+            #   columns are contaminated (universe-wide CS distribution).
+            #   Kept only for --no_rolling_universe baseline runs.
+            # - bundle.single == False (per-epoch dir): fetch this epoch's
+            #   own panel, which was built with CS computed across THIS
+            #   epoch's universe only — no out-of-universe or delisted
+            #   contamination of cross-sectional stats.
+            if bundle.single:
+                panel_ep = panel[panel["symbol"].isin(ep_syms)].copy()
+            else:
+                panel_ep = bundle.get_panel_by_snap(ep_dict["snapshot_date"])
+                if panel_ep is None:
+                    print(
+                        f"    [skip] No panel for epoch snap "
+                        f"{ep_dict['snapshot_date']}")
+                    return None
+                panel_ep = panel_ep.copy()
+                panel_ep["ts"] = pd.to_datetime(panel_ep["ts"])
+                panel_ep = (panel_ep
+                            .sort_values(["ts", "symbol"])
+                            .reset_index(drop=True))
             if panel_ep.empty:
                 return None
 
@@ -1769,6 +1919,8 @@ def main():
              cmi_ep, reg_ep) = _run_epoch_pipeline(
                 panel_ep, feature_cols, args, ebm_kwargs,
                 expert_ebm_kwargs, model_dir,
+                epoch_pred_start=ep_start,
+                epoch_pred_end=ep_end,
             )
 
             # Slice every per-epoch artifact to the epoch's active date

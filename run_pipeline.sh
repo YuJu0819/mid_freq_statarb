@@ -27,7 +27,7 @@ set -e   # exit immediately on any error
 # --- Configuration -----------------------------------------------------------
 START_DATE="2024-01-01"
 END_DATE="2025-12-31"
-RUN_ID="batch_v2"
+RUN_ID="production_v2"
 MOM_ALLOC="0.6"
 REV_ALLOC="0.4"
 LS_DAYS="30"          # days of l/s history to fetch in step 2
@@ -212,7 +212,7 @@ fi
 # --- Step 9: EBM signal ------------------------------------------------------
 if should_run 9; then
     step_header 9 "train_ebm_signal"
-    PANEL_PATH="./data/ml/factor_panel_${START_DATE}_${END_DATE}.parquet"
+    PANEL_PATH="./data/ml/factor_panel_${START_DATE}_${END_DATE}"
     python -m src.scripts.build.train_ebm_signal \
         --run_id        "$RUN_ID" \
         --panel_path    "$PANEL_PATH" \
@@ -274,7 +274,7 @@ fi
 # --- Step 11: Inspect raw EBM predictions (optional) ------------------------
 if should_run 11; then
     step_header 11 "analyze_ebm_predictions"
-    PANEL_PATH="./data/ml/factor_panel_${START_DATE}_${END_DATE}.parquet"
+    PANEL_PATH="./data/ml/factor_panel_${START_DATE}_${END_DATE}"
     python -m src.scripts.analysis.analyze_ebm_predictions \
         --run_id        "$RUN_ID" \
         --panel_path    "$PANEL_PATH" \

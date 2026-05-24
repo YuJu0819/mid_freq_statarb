@@ -14,17 +14,17 @@ Surfaces:
 Usage
 -----
     # Exact name
-    python -m src.scripts.search_factor --run_id batch_v2 --factor volatility_30
+    python -m src.scripts.search_factor --run_id production_v2 --factor volatility_30
 
     # Substring search — when multiple match, prints candidates and exits
-    python -m src.scripts.search_factor --run_id batch_v2 --factor vol
+    python -m src.scripts.search_factor --run_id production_v2 --factor vol
 
     # Top-K interactions to show (default 15)
-    python -m src.scripts.search_factor --run_id batch_v2 \\
+    python -m src.scripts.search_factor --run_id production_v2 \\
         --factor liquidation_shock --top_k_interactions 20
 
     # Persist artefacts under reports/strategies/<run>/factor_<name>/
-    python -m src.scripts.search_factor --run_id batch_v2 \\
+    python -m src.scripts.search_factor --run_id production_v2 \\
         --factor regime_score --save
 """
 import argparse

@@ -355,11 +355,33 @@ def main():
         print("  ebm.parquet not found — score vs weight panel will be skipped")
 
     # ── Load panel (optional) ─────────────────────────────────────────────────
+    # Accepts either a single .parquet (legacy) or a per-epoch directory
+    # (current default). For the analyses below we only consume
+    # universe-INDEPENDENT columns (`ret_1d` for IC, `beta_col` for
+    # neutralization), which are identical across per-epoch panels. We
+    # therefore build a meta-panel by unioning + de-duplicating per-epoch
+    # rows. CS columns are NOT consumed here, so per-fold routing is
+    # unnecessary in this script.
     panel = None
     if args.panel_path and os.path.exists(args.panel_path):
         print(f"Loading panel: {args.panel_path}")
-        panel = pd.read_parquet(args.panel_path)
-        print(f"  Panel shape: {panel.shape}")
+        from ...factor_panel_io import load_panel
+        bundle = load_panel(args.panel_path, eager=True)
+        if bundle.single:
+            panel = bundle.panel
+            print(f"  [single-universe] Panel shape: {panel.shape}")
+        else:
+            frames = []
+            for snap, p_ep in bundle.iter_panels():
+                p_ep = p_ep.copy()
+                p_ep["ts"] = pd.to_datetime(p_ep["ts"])
+                frames.append(p_ep)
+            panel = (pd.concat(frames, ignore_index=True)
+                     .sort_values(["ts", "symbol"])
+                     .drop_duplicates(["ts", "symbol"], keep="last")
+                     .reset_index(drop=True))
+            print(f"  [per-epoch, {len(bundle.epochs)} epochs → meta panel] "
+                  f"shape: {panel.shape}")
     else:
         if args.panel_path:
             print(f"  [warn] Panel not found at {args.panel_path} — IC skipped")

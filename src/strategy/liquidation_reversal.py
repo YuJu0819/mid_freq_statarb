@@ -12,7 +12,12 @@ class LiquidationReversalStrategy:
                  oi_level_lookback=90,
                  beta_lookback=60,
                  regime_window=5,
-                 regime_filter_threshold=0.6):
+                 regime_filter_threshold=0.6,
+                 # Risk-control knobs (added after the 2022 cascade post-mortem).
+                 # See _normalize_balanced for the exact semantics.
+                 max_weight: float = 0.10,
+                 side_balance: bool = True,
+                 min_active_symbols: int = 3):
         self.half_life_decay = half_life_decay
         self.leverage_scale = leverage_scale
         self.ts_lookback = ts_lookback
@@ -21,6 +26,121 @@ class LiquidationReversalStrategy:
         self.beta_lookback = beta_lookback
         self.regime_window = regime_window
         self.regime_filter_threshold = regime_filter_threshold
+        self.max_weight = max_weight
+        self.side_balance = side_balance
+        self.min_active_symbols = min_active_symbols
+
+    @staticmethod
+    def _normalize_balanced(
+        signal_wide: pd.DataFrame,
+        leverage_scale: float,
+        max_weight: float | None,
+        side_balance: bool,
+        min_active_symbols: int,
+    ) -> pd.DataFrame:
+        """
+        Convert a raw signal matrix (ts × symbol, sign carries direction) into
+        position weights that respect three risk constraints:
+
+          1. **Per-name cap**: no single symbol exceeds `|max_weight|` of book.
+             Iterative water-fill: clip, re-normalize the side, repeat until
+             stable. Skip if `max_weight is None`.
+
+          2. **Side balance**: long L1 == short L1 == leverage_scale / 2 on
+             every day. Eliminates the natural sign-asymmetry-driven net
+             exposure that plagued early-period weights (e.g. 2022 net = +0.54
+             on the LUNA-cascade day → -15% single-day loss). When
+             `side_balance=False` falls back to legacy L1-on-gross.
+
+          3. **Thin-universe filter**: if the day has fewer than
+             `min_active_symbols` non-zero positions on either side, zero the
+             whole row. Prevents the strategy from emitting a single-name
+             "portfolio" during 2021 when only 1–3 symbols had usable data.
+        """
+        df = signal_wide.copy()
+
+        # 3. Thin-day filter (applied to RAW signal counts before any
+        # normalization, so we drop days where neither side has breadth).
+        if min_active_symbols and min_active_symbols > 0:
+            n_long = (df > 0).sum(axis=1)
+            n_short = (df < 0).sum(axis=1)
+            if side_balance:
+                thin = (n_long < min_active_symbols) | (
+                    n_short < min_active_symbols)
+            else:
+                thin = (n_long + n_short) < min_active_symbols
+            if thin.any():
+                df.loc[thin] = 0.0
+
+        if not side_balance:
+            # Legacy: L1-on-gross. Preserved for ablation studies.
+            tot = df.abs().sum(axis=1).replace(0, 1.0)
+            weights = df.div(tot, axis=0) * leverage_scale
+            if max_weight is not None:
+                weights = LiquidationReversalStrategy._iter_cap(
+                    weights, leverage_scale, max_weight)
+            return weights
+
+        # 2. Side-balance: positive and negative halves each get L1 = lev/2.
+        long_part = df.clip(lower=0)
+        short_part = -df.clip(upper=0)  # made positive for normalization
+        long_l1 = long_part.sum(axis=1)
+        short_l1 = short_part.sum(axis=1)
+        # Rows where one side is empty cannot be balanced — zero them.
+        empty_side = (long_l1 <= 0) | (short_l1 <= 0)
+        long_part.loc[empty_side] = 0.0
+        short_part.loc[empty_side] = 0.0
+        long_l1 = long_part.sum(axis=1).replace(0, 1.0)
+        short_l1 = short_part.sum(axis=1).replace(0, 1.0)
+        long_norm = long_part.div(long_l1, axis=0) * (leverage_scale / 2.0)
+        short_norm = short_part.div(short_l1, axis=0) * (leverage_scale / 2.0)
+        weights = long_norm - short_norm  # shorts get back their negative sign
+
+        if max_weight is not None:
+            weights = LiquidationReversalStrategy._iter_cap(
+                weights, leverage_scale, max_weight)
+        return weights
+
+    @staticmethod
+    def _iter_cap(weights: pd.DataFrame,
+                  leverage_scale: float,
+                  max_weight: float,
+                  max_iters: int = 8) -> pd.DataFrame:
+        """
+        Clip per-name weights to ±max_weight and re-balance each side.
+
+        Edge case the naive water-fill misses: when `max_weight * n_per_side`
+        is smaller than the target L1 (leverage/2), the cap is infeasible and
+        iterative renormalization would either diverge or converge to an
+        equal-weight that violates the cap. Resolution: rescale each side to
+        the smaller of (target_per_side, capped_L1_long, capped_L1_short),
+        so the cap is never violated and side balance is preserved at the
+        cost of gross leverage < leverage_scale. This is the correct risk
+        behaviour — de-lever rather than over-concentrate.
+        """
+        target_per_side = leverage_scale / 2.0
+        for _ in range(max_iters):
+            clipped = weights.clip(lower=-max_weight, upper=max_weight)
+            longs = clipped.clip(lower=0)
+            shorts = -clipped.clip(upper=0)
+            l_l1 = longs.sum(axis=1)
+            s_l1 = shorts.sum(axis=1)
+            # Feasible per-side L1 = min(target, what longs/shorts can supply
+            # given the cap). Using min across (target, l_l1, s_l1) keeps
+            # both sides balanced and respects the cap.
+            target = pd.concat([
+                pd.Series(target_per_side, index=weights.index),
+                l_l1, s_l1,
+            ], axis=1).min(axis=1)
+            long_scale = (target / l_l1.where(l_l1 > 0, np.nan)).fillna(0.0)
+            short_scale = (target / s_l1.where(s_l1 > 0, np.nan)).fillna(0.0)
+            longs_n = longs.mul(long_scale, axis=0)
+            shorts_n = shorts.mul(short_scale, axis=0)
+            new_weights = longs_n - shorts_n
+            if (new_weights.sub(weights).abs() < 1e-12).all().all():
+                break
+            weights = new_weights
+        return new_weights
 
     def calculate_ts_zscore(self, df: pd.DataFrame, window: int) -> pd.DataFrame:
         # Phase-7 refactor note: this is NOT a duplicate of
@@ -83,9 +203,13 @@ class LiquidationReversalStrategy:
             ls_dict[sym] = df.set_index('ts')['ls_ratio']
             close_dict[sym] = df.set_index('ts')['futures_close']
 
-        df_oi = pd.DataFrame(oi_dict).ffill()
-        df_ls = pd.DataFrame(ls_dict).ffill()
-        df_close = pd.DataFrame(close_dict).ffill()
+        # Bounded ffill: a multi-day gap (mid-epoch delisting, ANKR→delisted)
+        # must become NaN rather than propagating the last value forever —
+        # otherwise the dead symbol's constant value yields pct_change == 0
+        # on every subsequent day inside the epoch, contaminating CS stats.
+        df_oi = pd.DataFrame(oi_dict).ffill(limit=5)
+        df_ls = pd.DataFrame(ls_dict).ffill(limit=5)
+        df_close = pd.DataFrame(close_dict).ffill(limit=5)
 
         raw_oi_chg = df_oi.pct_change().replace(
             [np.inf, -np.inf], np.nan).rolling(window=3).mean()
@@ -127,7 +251,7 @@ class LiquidationReversalStrategy:
         is_active = final_signal.abs() > 1e-8
         smoothed_ia = interaction_alpha.ewm(
             halflife=self.half_life_decay, min_periods=self.half_life_decay).mean()
-        abs_ia_active = smoothed_ia.abs().where(is_active)
+        abs_ia_active = final_z_oi_chg.abs().where(is_active)
         ia_pct = abs_ia_active.rank(axis=1, pct=True)
         q1_mask = is_active & (ia_pct >= 0.5)
 
@@ -144,13 +268,25 @@ class LiquidationReversalStrategy:
         # Compute BOTH normalizations independently — when the mask is
         # disabled they're identical; when enabled the unmasked version
         # preserves its own L1-normalization.
-        total_signal_strength = final_signal.abs().sum(axis=1).replace(0, 1.0)
-        final_weights = final_signal.div(
-            total_signal_strength, axis=0) * self.leverage_scale
-
-        total_unmasked = final_signal_unmasked.abs().sum(axis=1).replace(0, 1.0)
-        final_weights_unmasked = final_signal_unmasked.div(
-            total_unmasked, axis=0) * self.leverage_scale
+        # Apply risk-controlled normalization:
+        #   - max_weight cap (no single name dominates the book)
+        #   - side-balanced L1 (long L1 == short L1 == leverage/2)
+        #   - thin-day filter (skip rows with too few active symbols per side)
+        # See LiquidationReversalStrategy._normalize_balanced for details.
+        final_weights = self._normalize_balanced(
+            final_signal,
+            leverage_scale=self.leverage_scale,
+            max_weight=self.max_weight,
+            side_balance=self.side_balance,
+            min_active_symbols=self.min_active_symbols,
+        )
+        final_weights_unmasked = self._normalize_balanced(
+            final_signal_unmasked,
+            leverage_scale=self.leverage_scale,
+            max_weight=self.max_weight,
+            side_balance=self.side_balance,
+            min_active_symbols=self.min_active_symbols,
+        )
 
         def _stack(wide: pd.DataFrame, name: str) -> pd.Series:
             s = wide.stack()

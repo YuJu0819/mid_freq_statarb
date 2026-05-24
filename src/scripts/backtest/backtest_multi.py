@@ -109,6 +109,11 @@ def main():
              "factor panel) get full warmup. Only equity curve, Sharpe, "
              "summary metrics, score-history factor analysis, and plots are "
              "computed over the trimmed range.")
+    ap.add_argument(
+        "--oos_start_date", default=None,
+        help="Optional. Date (YYYY-MM-DD) at which to draw the IS|OOS divider "
+             "line on the equity-curve plot. Purely a visual annotation; does "
+             "not affect metrics or trimming. If omitted, no divider is drawn.")
     args = ap.parse_args()
     cfg = load_config()
 
@@ -309,7 +314,10 @@ def main():
         end_str = res.equity_curve.index[-1].strftime('%Y-%m-%d')
         save_path = os.path.join(
             report_dir, f"equity_curve_{start_str}_to_{end_str}.png")
-        plot_equity_curve(res.equity_curve, save_path)
+        plot_equity_curve(
+            res.equity_curve, save_path,
+            split_date=args.oos_start_date,
+        )
 
         generate_daily_regime_analysis(res.equity_curve)
         generate_predictive_regime_analysis(res.equity_curve)  # <-- NEW CALL

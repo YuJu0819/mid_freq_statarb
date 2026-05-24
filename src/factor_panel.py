@@ -43,12 +43,17 @@ def _make_wide(
     Callers that need a specific neutral value (e.g. `ls_ratio` defaults to
     1.0 when missing) should pass `fill=` explicitly.
 
-    `ffill` is applied so transient one-day gaps don't drop a row, but a
-    symbol that was never tracked stays NaN (no false data is invented).
+    `ffill` is bounded so transient one-day API gaps don't drop a row, but
+    a multi-day gap (e.g. a delisted symbol whose feed stopped emitting)
+    becomes NaN after `limit=5` days. The previous unbounded ffill caused
+    delisted symbols' last value to propagate to end-of-panel, producing
+    `pct_change == 0` on every subsequent day — those zeros then leaked
+    into `_cs_zscore` and contaminated the cross-sectional distribution
+    for every live symbol on every date.
     """
     d = {sym: df.set_index("ts")[col]
          for sym, df in data.items() if col in df.columns}
-    return pd.DataFrame(d).reindex(all_ts).ffill().fillna(fill)
+    return pd.DataFrame(d).reindex(all_ts).ffill(limit=5).fillna(fill)
 
 
 def _ffill_with_limit(df: pd.DataFrame, limit_days: int = 5) -> pd.DataFrame:
@@ -152,19 +157,23 @@ def compute_factors(
     else:
         oi_wide = _make_wide(mom_data, "open_interest", all_ts, fill=np.nan)
 
-    # Regime columns are market-wide (same for all symbols each day)
+    # Regime columns are market-wide (same for all symbols each day). The
+    # previous guard checked only `next(iter(mom_data.values()))` — if that
+    # one symbol had a stale cache that pre-dated adding `market_volatility`,
+    # the column was silently dropped even though every other symbol carried
+    # it. Scan ALL symbols and pick the first that has the column.
     regime_cols = ["volatility_regime", "trend_regime", "skew_regime", "adx",
                    "market_volatility"]
     regime_frames = []
     for col in regime_cols:
-        if col in next(iter(mom_data.values()), pd.DataFrame()).columns:
-            sample_sym = next(
-                sym for sym, df in mom_data.items() if col in df.columns
-            )
-            series = mom_data[sample_sym].set_index(
-                "ts")[col].reindex(all_ts).ffill()
-            series.name = "market_adx" if col == "adx" else col
-            regime_frames.append(series)
+        sample_sym = next(
+            (sym for sym, df in mom_data.items() if col in df.columns), None)
+        if sample_sym is None:
+            continue
+        series = mom_data[sample_sym].set_index(
+            "ts")[col].reindex(all_ts).ffill()
+        series.name = "market_adx" if col == "adx" else col
+        regime_frames.append(series)
 
     # L/S ratio: prefer metrics_store (full historical archive) over the
     # recent parquet accumulation store which only covers the last ~30 days.

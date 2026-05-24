@@ -12,9 +12,9 @@ and emits:
 
 Usage
 -----
-    python -m src.scripts.analyze_factor_health --run_id batch_v2
-    python -m src.scripts.analyze_factor_health --run_id batch_v2 --top_n 20
-    python -m src.scripts.analyze_factor_health --run_id batch_v2 --max_folds 5
+    python -m src.scripts.analyze_factor_health --run_id production_v2
+    python -m src.scripts.analyze_factor_health --run_id production_v2 --top_n 20
+    python -m src.scripts.analyze_factor_health --run_id production_v2 --max_folds 5
 
 The script auto-handles both vanilla `list[EBM]` pickles and `ResidualMoE`
 pickles — when MoE, it analyses the global ensemble. Pass --expert REGIME to
@@ -228,6 +228,7 @@ def _compare_all_models(run_dir: str, model_dir: str, args) -> pd.DataFrame:
     fhe_kwargs = dict(
         drop_tail_core_ratio_thresh=args.drop_tail_core_ratio_thresh,
         drop_cross_bag_var_pctile=args.drop_cross_bag_var_pctile,
+        drop_cross_bag_var_min_abs=args.drop_cross_bag_var_min_abs,
         expert_monotonicity_thresh=args.expert_monotonicity_thresh,
         core_density_thresh=args.core_density_thresh,
     )
@@ -436,7 +437,21 @@ def main():
              "(density < 0.05) exceeds this multiple of max|score| in "
              "core bins. Default 3.0 per spec.")
     ap.add_argument(
-        "--drop_cross_bag_var_pctile", type=float, default=0.80)
+        "--drop_cross_bag_var_pctile", type=float, default=0.80,
+        help="Cross-bag-variance percentile threshold for DROP_unstable. "
+             "Combined with --drop_cross_bag_var_min_abs (logical AND) so "
+             "that on well-behaved datasets where every feature has "
+             "noise-level variance, the rule does not fire on useful "
+             "high-rank factors that just happen to be in the top 20% of "
+             "a near-zero distribution.")
+    ap.add_argument(
+        "--drop_cross_bag_var_min_abs", type=float, default=1e-4,
+        help="Absolute floor for the DROP_unstable rule. cbv must exceed "
+             "BOTH the pctile threshold AND this floor. Set to 0.0 to "
+             "recover the original purely-relative behaviour. Default 1e-4 "
+             "is calibrated to typical EBM shape magnitudes O(0.01-1) — "
+             "anything below is essentially numerical noise from bag "
+             "bootstrap, not meaningful instability.")
     ap.add_argument(
         "--expert_monotonicity_thresh", type=float, default=0.30)
     ap.add_argument(
@@ -522,6 +537,7 @@ def main():
         feature_names=feature_names,
         drop_tail_core_ratio_thresh=args.drop_tail_core_ratio_thresh,
         drop_cross_bag_var_pctile=args.drop_cross_bag_var_pctile,
+        drop_cross_bag_var_min_abs=args.drop_cross_bag_var_min_abs,
         expert_monotonicity_thresh=args.expert_monotonicity_thresh,
         core_density_thresh=args.core_density_thresh,
     )

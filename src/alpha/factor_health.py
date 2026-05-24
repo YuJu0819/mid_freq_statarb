@@ -360,7 +360,19 @@ class FactorHealthEvaluator:
         densely-populated bins, i.e. the model is leaning on sparse outlier
         bins. Defaults follow the spec.
     drop_cross_bag_var_pctile : float, default 0.80
-        Cross-bag variance above this fold-level percentile → DROP.
+        Cross-bag variance above this fold-level percentile → DROP. This is
+        a RELATIVE threshold — the top (1 - pctile) fraction of features
+        will exceed it by construction. Combined with
+        `drop_cross_bag_var_min_abs` to avoid flagging noise-level variances
+        as "unstable" on a well-behaved dataset.
+    drop_cross_bag_var_min_abs : float, default 1e-4
+        Absolute minimum cross-bag variance required for the
+        DROP_unstable rule to fire. Acts as a safety floor below which
+        bag-to-bag variation is numerical noise rather than meaningful
+        instability. Typical EBM shape magnitudes are O(0.01–1), so
+        variance < 1e-4 (bag-stdev < 1% of shape magnitude) is essentially
+        noise. Set to 0.0 to disable the floor and recover the original
+        purely-relative behaviour.
     expert_monotonicity_thresh : float, default 0.30
         |monotonicity| below this AND top-N importance → EXPERT.
     """
@@ -370,6 +382,7 @@ class FactorHealthEvaluator:
         feature_names: list[str],
         drop_tail_core_ratio_thresh: float = 3.0,
         drop_cross_bag_var_pctile: float = 0.80,
+        drop_cross_bag_var_min_abs: float = 1e-4,
         expert_monotonicity_thresh: float = 0.30,
         core_density_thresh: float = 0.05,
     ) -> None:
@@ -387,6 +400,7 @@ class FactorHealthEvaluator:
         self.feature_names = list(feature_names)
         self.drop_tail_core_ratio_thresh = drop_tail_core_ratio_thresh
         self.drop_cross_bag_var_pctile = drop_cross_bag_var_pctile
+        self.drop_cross_bag_var_min_abs = drop_cross_bag_var_min_abs
         self.expert_monotonicity_thresh = expert_monotonicity_thresh
         self.core_density_thresh = core_density_thresh
 
@@ -583,8 +597,15 @@ class FactorHealthEvaluator:
         which one fired.
         """
         out = agg_df.copy()
-        cbv_thr = out["cross_bag_variance_mean"].quantile(
+        # Effective cbv threshold = max(pctile-based, absolute-min). The
+        # pctile alone is always relative and will drop the top (1 - p) of
+        # features even when the entire distribution is noise-level. The
+        # absolute floor prevents the rule from firing on well-behaved
+        # datasets where useful, top-ranked features end up above the 80th
+        # pctile of a near-zero variance distribution. See class docstring.
+        cbv_pctile = out["cross_bag_variance_mean"].quantile(
             self.drop_cross_bag_var_pctile)
+        cbv_thr = max(cbv_pctile, self.drop_cross_bag_var_min_abs)
         out["cross_bag_var_thresh"] = cbv_thr
 
         def _decide(row):

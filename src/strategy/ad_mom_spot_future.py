@@ -345,7 +345,11 @@ class FinalStrategy:
             d = {sym: all_data[sym].set_index('ts')[col]
                  for sym in active_symbols
                  if sym in all_data and col in all_data[sym].columns}
-            return pd.DataFrame(d).reindex(all_ts).ffill().fillna(fill_val)
+            # Bounded ffill: a mid-epoch delisting (multi-day gap) must
+            # become NaN, not propagate the last value forever. Unbounded
+            # ffill produced pct_change == 0 for delisted symbols on every
+            # subsequent day, contaminating CS stats for live symbols.
+            return pd.DataFrame(d).reindex(all_ts).ffill(limit=5).fillna(fill_val)
 
         closes_wide = make_wide('futures_close')
         oi_wide = make_wide('open_interest')

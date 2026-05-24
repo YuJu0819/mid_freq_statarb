@@ -373,8 +373,25 @@ def main():
     pred_path = os.path.join(out_dir, "ebm_predictions.parquet")
 
     # ── Load data ─────────────────────────────────────────────────────────
+    # Accepts either a single .parquet (legacy) or a per-epoch directory.
+    # This script only consumes universe-INDEPENDENT columns (regime_col,
+    # target_col), so a meta-panel built from per-epoch panels (union +
+    # dedupe on (ts, symbol)) is sufficient — no per-fold routing needed.
     print(f"Loading panel: {args.panel_path}")
-    panel = pd.read_parquet(args.panel_path)
+    from ...factor_panel_io import load_panel
+    bundle = load_panel(args.panel_path, eager=True)
+    if bundle.single:
+        panel = bundle.panel
+    else:
+        frames = []
+        for snap, p_ep in bundle.iter_panels():
+            p_ep = p_ep.copy()
+            p_ep["ts"] = pd.to_datetime(p_ep["ts"])
+            frames.append(p_ep)
+        panel = (pd.concat(frames, ignore_index=True)
+                 .sort_values(["ts", "symbol"])
+                 .drop_duplicates(["ts", "symbol"], keep="last")
+                 .reset_index(drop=True))
     panel["ts"] = pd.to_datetime(panel["ts"])
     panel = panel.sort_values(["ts", "symbol"]).reset_index(drop=True)
 

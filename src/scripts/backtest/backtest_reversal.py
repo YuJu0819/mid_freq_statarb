@@ -80,6 +80,26 @@ def main():
              "factor panel) get full warmup. Only equity curve, Sharpe, "
              "summary metrics, score-history factor analysis, and plots are "
              "computed over the trimmed range.")
+    parser.add_argument(
+        "--max_weight", type=float, default=0.10,
+        help="Per-name weight cap. Iterative water-fill clip + renormalize "
+             "per side. Set to a value > leverage to disable the cap.")
+    parser.add_argument(
+        "--no_side_balance", dest="side_balance", action="store_false",
+        default=True,
+        help="Disable side-balanced L1 normalization (revert to legacy "
+             "L1-on-gross). Without this flag, long L1 == short L1 == "
+             "leverage/2 on every day → strictly net-zero, market-neutral.")
+    parser.add_argument(
+        "--min_active_symbols", type=int, default=30,
+        help="Zero-out the weight row if either side has fewer than this many "
+             "active positions. Prevents single-name 'portfolios' during "
+             "thin-universe periods (e.g. early 2021).")
+    parser.add_argument(
+        "--oos_start_date", default=None,
+        help="Optional. Date (YYYY-MM-DD) at which to draw the IS|OOS divider "
+             "line on the equity-curve plot. Purely a visual annotation; does "
+             "not affect metrics or trimming. If omitted, no divider is drawn.")
     args = parser.parse_args()
     cfg = load_config(args.config)
 
@@ -236,7 +256,10 @@ def main():
         oi_level_lookback=90,
         sentiment_ma_window=90,
         ts_lookback=90,
-        half_life_decay=3
+        half_life_decay=3,
+        max_weight=args.max_weight,
+        side_balance=args.side_balance,
+        min_active_symbols=args.min_active_symbols
     )
 
     print(f"\nRunning Simulation on {len(all_data)} assets...")
@@ -264,8 +287,11 @@ def main():
         report_dir = ensure_dir(f"./reports/strategies/{args.run_id}")
         res.equity_curve.to_csv(os.path.join(
             report_dir, "equity_curve_reversal.csv"))
-        plot_equity_curve(res.equity_curve, os.path.join(
-            report_dir, "equity_curve_reversal.png"))
+        plot_equity_curve(
+            res.equity_curve,
+            os.path.join(report_dir, "equity_curve_reversal.png"),
+            split_date=args.oos_start_date,
+        )
 
         # analyze_factor_quantiles needs 'close_price', which the reversal strategy
         # doesn't include in score_history. Join it in from all_data here.
